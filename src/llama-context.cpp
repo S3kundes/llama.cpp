@@ -14,6 +14,7 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -42,6 +43,15 @@ static const llm_fused_op_probe llm_fused_op_flash_attn_probe = {
     /*.name             =*/ "Flash Attention",
     /*.n_tokens_per_seq =*/ 1,
 };
+
+static bool llama_dsv4_tensor_kv_split_layer(const llama_model & model) {
+    const char * split_kv = getenv("LLAMA_DSV4_TENSOR_KV_SPLIT");
+    return model.arch == LLM_ARCH_DEEPSEEK4 &&
+        model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
+        split_kv != nullptr &&
+        (strcmp(split_kv, "layer") == 0 || strcmp(split_kv, "1") == 0) &&
+        !model.get_split_state_ud.devices.empty();
+}
 
 static const llm_fused_op_probe llm_fused_op_gdn_ar_probe = {
     /*.op               =*/ LLM_FUSED_OP_GDN_AR,
@@ -330,6 +340,18 @@ llama_context::llama_context(
                 throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev.dev)));
             }
             backends.emplace_back(backend);
+        }
+
+        // DSV4 can keep tensor-parallel weights on Meta while placing KV buffers on physical devices.
+        // The scheduler must know those devices in order to own the preallocated KV tensors.
+        if (llama_dsv4_tensor_kv_split_layer(model)) {
+            for (auto * dev : model.get_split_state_ud.devices) {
+                ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+                if (backend == nullptr) {
+                    throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev)));
+                }
+                backends.emplace_back(backend);
+            }
         }
 
         // add ACCEL backends (such as BLAS)

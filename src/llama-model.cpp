@@ -25,6 +25,7 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <functional>
@@ -376,6 +377,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_ffn_down_weight   ("blk\\.\\d*\\.ffn_down(_exps)?.weight");
     static const std::regex pattern_ffn_down_bias     ("blk\\.\\d*\\.ffn_down.bias");
     static const std::regex pattern_ffn_down_exps_bias("blk\\.\\d*\\.ffn_down_exps.bias");
+    static const std::regex pattern_ffn_up_shexp_weight  ("blk\\.\\d*\\.ffn_up_shexp\\.weight");
+    static const std::regex pattern_ffn_gate_shexp_weight("blk\\.\\d*\\.ffn_gate_shexp\\.weight");
+    static const std::regex pattern_ffn_down_shexp_weight("blk\\.\\d*\\.ffn_down_shexp\\.weight");
 
     static const std::regex pattern_output_weight("output\\.weight");
     static const std::regex pattern_output_bias  ("output\\.bias");
@@ -483,6 +487,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
             if (std::regex_match(tensor_name, pattern_attn_q_a_weight) || std::regex_match(tensor_name, pattern_attn_kv_weight)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+            if (std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) || std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down_shexp.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
             }
         }
 
@@ -694,7 +704,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         // FFN
         if (std::regex_match(tensor_name, pattern_ffn_up_weight) || std::regex_match(tensor_name, pattern_ffn_up_bias) ||
                 std::regex_match(tensor_name, pattern_ffn_gate_weight) || std::regex_match(tensor_name, pattern_ffn_gate_bias) ||
-                std::regex_match(tensor_name, pattern_ffn_gate_up_weight) || std::regex_match(tensor_name, pattern_ffn_down_weight)) {
+                std::regex_match(tensor_name, pattern_ffn_gate_up_weight) || std::regex_match(tensor_name, pattern_ffn_down_weight) ||
+                std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) || std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight) ||
+                std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
             const int64_t blck_size_perf = std::lcm(blck_size, 128);
             GGML_ASSERT(segments.size() == 1);
             return {blck_size_perf};
@@ -1992,6 +2004,42 @@ void llama_model::print_info() const {
 
 ggml_backend_dev_t llama_model::dev_layer(int il) const {
     return pimpl->dev_layer.at(il).dev;
+}
+
+ggml_backend_dev_t llama_model::dev_layer_cache(int il) const {
+    ggml_backend_dev_t dev = dev_layer(il);
+
+    const char * split_kv = getenv("LLAMA_DSV4_TENSOR_KV_SPLIT");
+    if (arch != LLM_ARCH_DEEPSEEK4 || params.split_mode != LLAMA_SPLIT_MODE_TENSOR ||
+            split_kv == nullptr || (strcmp(split_kv, "layer") != 0 && strcmp(split_kv, "1") != 0) ||
+            get_split_state_ud.devices.empty() || devices.empty() || dev != devices.front().dev) {
+        return dev;
+    }
+
+    const size_t n_devs = get_split_state_ud.devices.size();
+    GGML_ASSERT(n_devs > 0);
+
+    const float * tensor_split = params.tensor_split;
+    const bool all_zero = tensor_split == nullptr ||
+        std::all_of(tensor_split, tensor_split + n_devs, [](float x) { return x == 0.0f; });
+
+    std::vector<float> splits(n_devs);
+    float split_sum = 0.0f;
+    for (size_t i = 0; i < n_devs; ++i) {
+        split_sum += all_zero ? 1.0f : tensor_split[i];
+        splits[i] = split_sum;
+    }
+    GGML_ASSERT(split_sum > 0.0f);
+    for (float & split : splits) {
+        split /= split_sum;
+    }
+
+    const float pos = (float) il / std::max<int>(hparams.n_layer_all, 1);
+    const size_t idev = std::min<size_t>(
+            std::upper_bound(splits.begin(), splits.end(), pos) - splits.begin(),
+            n_devs - 1);
+
+    return get_split_state_ud.devices[idev];
 }
 
 ggml_backend_dev_t llama_model::dev_output() const {

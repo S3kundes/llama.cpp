@@ -564,7 +564,21 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_simple_buffer(ggml_backend
     return buf_ctx->bufs[index].get();
 }
 
+static bool ggml_backend_meta_external_noop_node(const struct ggml_tensor * tensor) {
+    if (tensor->buffer == nullptr || ggml_backend_buffer_is_meta(tensor->buffer)) {
+        return false;
+    }
+
+    return tensor->op == GGML_OP_NONE || tensor->op == GGML_OP_VIEW || tensor->op == GGML_OP_RESHAPE ||
+        tensor->op == GGML_OP_PERMUTE || tensor->op == GGML_OP_TRANSPOSE;
+}
+
 static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct ggml_tensor * tensor, size_t index) {
+    if (!ggml_backend_buffer_is_meta(tensor->buffer)) {
+        GGML_LOG_ERROR("%s: tensor %s op=%s buffer=%s is not a Meta buffer\n", __func__,
+                ggml_backend_meta_tensor_name(tensor), ggml_op_name(tensor->op),
+                tensor->buffer ? ggml_backend_buffer_name(tensor->buffer) : "none");
+    }
     GGML_ASSERT(ggml_backend_buffer_is_meta(tensor->buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
     GGML_ASSERT(index < buf_ctx->bufs.size());
@@ -1887,10 +1901,15 @@ struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struc
             }
         }
         if (!meta_buf_ctx->bufs[i]) {
-            GGML_LOG_ERROR("META_ALLOC_CTX_ERROR: simple_buft=%zu\n", i);
+            GGML_LOG_ERROR("META_ALLOC_CTX_ERROR: simple_buft=%zu, buft=%s\n", i, ggml_backend_buft_name(simple_buft));
         }
         GGML_ASSERT(meta_buf_ctx->bufs[i]);
-        meta_buf->size = std::max(meta_buf->size, ggml_backend_buffer_get_size(meta_buf_ctx->bufs[i].get()));
+        const size_t simple_size = ggml_backend_buffer_get_size(meta_buf_ctx->bufs[i].get());
+        if (meta_buf_ctx->debug > 0) {
+            GGML_LOG_INFO("META_ALLOC_CTX_BUFFER: simple_buft=%zu, buft=%s, size=%8.2f MiB\n",
+                    i, ggml_backend_buft_name(simple_buft), simple_size/1024.0/1024.0);
+        }
+        meta_buf->size = std::max(meta_buf->size, simple_size);
     }
     return meta_buf;
 }
@@ -2148,6 +2167,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     bcj.nodes[i] = node;
                     continue;
                 }
+                if (ggml_backend_meta_external_noop_node(node)) {
+                    bcj.nodes[i] = node;
+                    continue;
+                }
                 bcj.nodes[i] = ggml_backend_meta_buffer_simple_tensor(node, j);
                 GGML_ASSERT(bcj.nodes[i]);
             }
@@ -2166,6 +2189,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 auto skip_unrelated = [&]() {
                     while (id + 1 < cgraph->n_nodes) {
                         ggml_tensor * next = cgraph->nodes[id+1];
+                        if (ggml_backend_meta_external_noop_node(next)) {
+                            id++;
+                            continue;
+                        }
                         if (ggml_backend_meta_get_split_state(next, false).axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
                             break;
                         }
@@ -2259,6 +2286,25 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(node->view_src->buffer)) {
+                    if (i + 1 == cgraph->n_nodes) {
+                        for (size_t j = 0; j < n_backends; j++) {
+                            auto & bcj = backend_ctx->backend_configs[j];
+                            bcj.cgraphs[n_subgraphs].offset = i_start;
+                        }
+                        n_subgraphs++;
+                        i_start = i + 1;
+                    }
+                    continue;
+                }
+                if (ggml_backend_meta_external_noop_node(node)) {
+                    if (i + 1 == cgraph->n_nodes) {
+                        for (size_t j = 0; j < n_backends; j++) {
+                            auto & bcj = backend_ctx->backend_configs[j];
+                            bcj.cgraphs[n_subgraphs].offset = i_start;
+                        }
+                        n_subgraphs++;
+                        i_start = i + 1;
+                    }
                     continue;
                 }
                 const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(node, /*assume_sync =*/ false);

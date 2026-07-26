@@ -347,11 +347,15 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_kv_bias         ("blk\\.\\d*\\.attn_(k|v)\\.bias");
     static const std::regex pattern_qkv_bias        ("blk\\.\\d*\\.attn_qkv.bias");
     static const std::regex pattern_qk_norm         ("blk\\.\\d*\\.attn_(q|k)_norm\\.weight");
-    static const std::regex pattern_kv_cache        ("cache_(k|v)_l\\d*");
-    static const std::regex pattern_attn_sinks      ("blk\\.\\d*\\.attn_sinks.weight");
-    static const std::regex pattern_attn_out_weight ("blk\\.\\d*\\.attn_output.weight");
-    static const std::regex pattern_attn_out_bias   ("blk\\.\\d*\\.attn_output.bias");
-    static const std::regex pattern_attn_gate_weight("blk\\.\\d*\\.attn_gate.weight");
+    static const std::regex pattern_kv_cache         ("cache_(k|v)_l\\d*");
+    static const std::regex pattern_dsv4_state       ("dsv4_(csa|hca|lid)_state_(kv|score)_l\\d*");
+    static const std::regex pattern_attn_sinks       ("blk\\.\\d*\\.attn_sinks.weight");
+    static const std::regex pattern_attn_out_weight  ("blk\\.\\d*\\.attn_output.weight");
+    static const std::regex pattern_attn_out_bias    ("blk\\.\\d*\\.attn_output.bias");
+    static const std::regex pattern_attn_out_a_weight("blk\\.\\d*\\.attn_output_a\\.weight");
+    static const std::regex pattern_attn_out_b_weight("blk\\.\\d*\\.attn_output_b\\.weight");
+    static const std::regex pattern_attn_q_b_weight  ("blk\\.\\d*\\.attn_q_b\\.weight");
+    static const std::regex pattern_attn_gate_weight ("blk\\.\\d*\\.attn_gate.weight");
 
     static const std::regex pattern_ssm_dt          ("blk\\.\\d*\\.ssm_dt.bias");
     static const std::regex pattern_ssm_a           ("blk\\.\\d*\\.ssm_a");
@@ -368,9 +372,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_ffn_gate_weight   ("blk\\.\\d*\\.ffn_gate(_exps)?.weight");
     static const std::regex pattern_ffn_gate_bias     ("blk\\.\\d*\\.ffn_gate(_exps)?.bias");
     static const std::regex pattern_ffn_gate_up_weight("blk\\.\\d*\\.ffn_gate_up(_exps)?.weight");
-    static const std::regex pattern_ffn_down_weight   ("blk\\.\\d*\\.ffn_down(_exps)?.weight");
-    static const std::regex pattern_ffn_down_bias     ("blk\\.\\d*\\.ffn_down.bias");
-    static const std::regex pattern_ffn_down_exps_bias("blk\\.\\d*\\.ffn_down_exps.bias");
+    static const std::regex pattern_ffn_down_weight     ("blk\\.\\d*\\.ffn_down(_exps)?.weight");
+    static const std::regex pattern_ffn_down_bias       ("blk\\.\\d*\\.ffn_down.bias");
+    static const std::regex pattern_ffn_down_exps_bias  ("blk\\.\\d*\\.ffn_down_exps.bias");
+    static const std::regex pattern_ffn_up_shexp_weight ("blk\\.\\d*\\.ffn_up_shexp.weight");
+    static const std::regex pattern_ffn_gate_shexp_weight("blk\\.\\d*\\.ffn_gate_shexp.weight");
+    static const std::regex pattern_ffn_down_shexp_weight("blk\\.\\d*\\.ffn_down_shexp.weight");
 
     static const std::regex pattern_output_weight("output\\.weight");
     static const std::regex pattern_output_bias  ("output\\.bias");
@@ -388,8 +395,16 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 const ggml_backend_meta_split_axis axis, const std::string & suffix = "", const std::string & suffix_fallback = "") -> tensor_config {
         // the layers in a tensor can be inhomogeneous, if the pattern is cleanly divided by the number of GPUs there can be aliasing effects,
         //     count only the same type of previous layers to avoid this
-        auto get_il_eff = [&](const size_t il){
+        auto get_il_eff = [&](const size_t il) {
             size_t ret = 0;
+            if (ud->model->arch == LLM_ARCH_DEEPSEEK4) {
+                const uint32_t ratio = hparams.dsv4_compress_ratios[il];
+                for (size_t il_prev = 0; il_prev < il; il_prev++) {
+                    ret += hparams.dsv4_compress_ratios[il_prev] == ratio;
+                }
+                return ret;
+            }
+
             const bool il_is_recr = hparams.is_recr(il);
             const bool il_is_swa  = hparams.is_swa(il);
             for (size_t il_prev = 0; il_prev < il; il_prev++) {
@@ -413,6 +428,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             il = std::stoull(tensor_name.substr(layer_index_start + 2));
             prefix = "blk." + std::to_string(il) + ".";
             rotation = get_il_eff(il) % ud->n_devices;
+        } else if (std::regex_match(tensor_name, pattern_dsv4_state)) {
+            const size_t layer_index_start = tensor_name.rfind("_l");
+            GGML_ASSERT(layer_index_start != std::string::npos);
+            il = std::stoull(tensor_name.substr(layer_index_start + 2));
+            prefix = "blk." + std::to_string(il) + ".";
+            rotation = get_il_eff(il) % ud->n_devices;
         } else {
             il = 0;
             rotation = hparams.n_layer() % ud->n_devices;
@@ -427,6 +448,30 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_tensor_config = [&]() -> tensor_config {
+        if (ud->model->arch == LLM_ARCH_DEEPSEEK4) {
+            if (std::regex_match(tensor_name, pattern_kv_cache) ||
+                    std::regex_match(tensor_name, pattern_dsv4_state)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+            if (std::regex_match(tensor_name, pattern_attn_sinks)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output_b.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_attn_q_b_weight) ||
+                    std::regex_match(tensor_name, pattern_attn_out_a_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output_b.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_attn_out_b_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
+            }
+            if (std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
+                    std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down_shexp.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down_shexp.weight");
+            }
+        }
+
         // standard attention
         if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_kv_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
@@ -612,6 +657,32 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 blck_size_perf *= 2;
             }
 
+            if (ud->model->arch == LLM_ARCH_DEEPSEEK4) {
+                const int64_t n_groups = hparams.dsv4_o_group_count;
+                const int64_t n_heads  = hparams.n_head(il);
+                const int64_t rank     = hparams.dsv4_o_lora_rank;
+                GGML_ASSERT(n_groups > 0 && n_heads % n_groups == 0);
+
+                const ggml_tensor * wo_b = ud->model->layers[il].wo_b;
+                GGML_ASSERT(wo_b != nullptr);
+                const int64_t groups_per_quantum = std::lcm(rank, ggml_blck_size(wo_b->type))/rank;
+                GGML_ASSERT(groups_per_quantum > 0 && groups_per_quantum <= n_groups);
+
+                if (std::regex_match(tensor_name, pattern_attn_sinks)) {
+                    GGML_ASSERT(segments.size() == 1);
+                    return {groups_per_quantum * n_heads/n_groups};
+                }
+                if (std::regex_match(tensor_name, pattern_attn_q_b_weight)) {
+                    GGML_ASSERT(segments.size() == 1);
+                    return {groups_per_quantum * n_heads/n_groups * hparams.n_embd_head_k(il)};
+                }
+                if (std::regex_match(tensor_name, pattern_attn_out_a_weight) ||
+                        std::regex_match(tensor_name, pattern_attn_out_b_weight)) {
+                    GGML_ASSERT(segments.size() == 1);
+                    return {groups_per_quantum * rank};
+                }
+            }
+
             if (std::regex_match(tensor_name, pattern_attn_sinks)) {
                 GGML_ASSERT(segments.size() == 1);
                 return {std::lcm(n_embd_q, blck_size_perf)/n_embd_q * n_gqa};
@@ -647,7 +718,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         // FFN
         if (std::regex_match(tensor_name, pattern_ffn_up_weight) || std::regex_match(tensor_name, pattern_ffn_up_bias) ||
                 std::regex_match(tensor_name, pattern_ffn_gate_weight) || std::regex_match(tensor_name, pattern_ffn_gate_bias) ||
-                std::regex_match(tensor_name, pattern_ffn_gate_up_weight) || std::regex_match(tensor_name, pattern_ffn_down_weight)) {
+                std::regex_match(tensor_name, pattern_ffn_gate_up_weight) || std::regex_match(tensor_name, pattern_ffn_down_weight) ||
+                std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
+                std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight) ||
+                std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
             const int64_t blck_size_perf = std::lcm(blck_size, 128);
             GGML_ASSERT(segments.size() == 1);
             return {blck_size_perf};
@@ -2198,6 +2272,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                     if (arch == LLM_ARCH_DEEPSEEK4) {
                         GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE);
+                        if (split_mode() == LLAMA_SPLIT_MODE_TENSOR && !cparams.flash_attn) {
+                            throw std::runtime_error("DeepSeek-V4 tensor split requires Flash Attention");
+                        }
 
                         res = new llama_kv_cache_dsv4(
                                 *this,

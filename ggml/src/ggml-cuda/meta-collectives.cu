@@ -232,6 +232,70 @@ static __global__ void pack_attention_parts(
     }
 }
 
+static __global__ void extract_attention_max(
+        const float2 * src,
+        float * dst,
+        int64_t n_rows) {
+    const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (i >= n_rows) {
+        return;
+    }
+    dst[i] = src[i].y > 0.0f ? src[i].x : -FLT_MAX;
+}
+
+static __global__ void pack_attention_reduction(
+        const float * src,
+        const float2 * src_meta,
+        const float * global_max,
+        float * dst,
+        int64_t n_head,
+        int64_t heads_per_rank,
+        int64_t value_dim,
+        int64_t n_query,
+        int64_t n_stream) {
+    const int64_t n = value_dim*n_head*n_query*n_stream;
+    const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+
+    int64_t tmp = i;
+    const int64_t d = tmp%value_dim;
+    tmp /= value_dim;
+    const int64_t head = tmp%n_head;
+    tmp /= n_head;
+    const int64_t query = tmp%n_query;
+    const int64_t stream = tmp/n_query;
+
+    const int64_t owner = head/heads_per_rank;
+    const int64_t local_head = head%heads_per_rank;
+    const int64_t local_rows = heads_per_rank*n_query*n_stream;
+    const int64_t local_row = (stream*n_query + query)*heads_per_rank + local_head;
+    const int64_t global_row = (stream*n_query + query)*n_head + head;
+    const float2 meta = src_meta[global_row];
+    const float scale = meta.y > 0.0f ? expf(meta.x - global_max[global_row]) : 0.0f;
+    const int64_t dst_row = owner*local_rows + local_row;
+    dst[dst_row*(value_dim + 1) + d] = scale*src[i];
+    if (d == 0) {
+        dst[dst_row*(value_dim + 1) + value_dim] = scale*meta.y;
+    }
+}
+
+static __global__ void normalize_attention_reduction(
+        const float * src,
+        float * dst,
+        int64_t value_dim,
+        int64_t n_rows) {
+    const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (i >= value_dim*n_rows) {
+        return;
+    }
+    const int64_t row = i/value_dim;
+    const int64_t d = i%value_dim;
+    const float denominator = src[row*(value_dim + 1) + value_dim];
+    dst[i] = denominator > 0.0f ? src[row*(value_dim + 1) + d]/denominator : 0.0f;
+}
+
 static __global__ void combine_attention_parts(
         const float * parts,
         const float2 * metas,
@@ -446,6 +510,10 @@ static bool execute_flash_attn(
     const int64_t q_elements = q_dim*n_query*n_head*n_stream;
     const int64_t out_elements = value_dim*n_head*n_query*n_stream;
     const int64_t out_rows = n_head*n_query*n_stream;
+    bool equal_heads = heads.head_count[0] > 0;
+    for (size_t r = 1; r < n_backends; ++r) {
+        equal_heads = equal_heads && heads.head_count[r] == heads.head_count[0];
+    }
 
     std::array<ggml_cuda_pool_alloc<float>, GGML_CUDA_MAX_DEVICES> q_local;
     std::array<ggml_cuda_pool_alloc<float>, GGML_CUDA_MAX_DEVICES> q_gathered;
@@ -453,6 +521,9 @@ static bool execute_flash_attn(
     std::array<ggml_cuda_pool_alloc<float>, GGML_CUDA_MAX_DEVICES> sinks_full;
     std::array<ggml_cuda_pool_alloc<uint8_t>, GGML_CUDA_MAX_DEVICES> fa_storage;
     std::array<ggml_cuda_pool_alloc<float2>, GGML_CUDA_MAX_DEVICES> fa_meta;
+    std::array<ggml_cuda_pool_alloc<float>, GGML_CUDA_MAX_DEVICES> global_max;
+    std::array<ggml_cuda_pool_alloc<float>, GGML_CUDA_MAX_DEVICES> packed_reduction;
+    std::array<ggml_cuda_pool_alloc<float>, GGML_CUDA_MAX_DEVICES> reduced_reduction;
     std::array<ggml_cuda_pool_alloc<float>, GGML_CUDA_MAX_DEVICES> packed_parts;
     std::array<ggml_cuda_pool_alloc<float2>, GGML_CUDA_MAX_DEVICES> packed_meta;
     std::array<ggml_cuda_pool_alloc<float>, GGML_CUDA_MAX_DEVICES> received_parts;
@@ -479,60 +550,85 @@ static bool execute_flash_attn(
                 (const char *) q->data, packed, q->ne[0], q->ne[1], q->ne[2], q->ne[3],
                 q->nb[0], q->nb[1], q->nb[2], q->nb[3]);
         q_gathered[r].alloc(ctx.pool(), q_elements);
-        q_full[r].alloc(ctx.pool(), q_elements);
+        if (n_stream > 1) {
+            q_full[r].alloc(ctx.pool(), q_elements);
+        }
         if (has_sinks) {
             sinks_full[r].alloc(ctx.pool(), n_head);
         }
     }
     GGML_ASSERT(q_total == q_elements);
 
-    for (size_t dst = 0; dst < n_backends; ++dst) {
-        ggml_backend_cuda_context & ctx = get_cuda_context(backends[dst]);
-        ggml_cuda_set_device(ctx.device);
-        CUDA_CHECK(cudaMemcpyAsync(q_gathered[dst].get() + q_offset[dst], q_local[dst].get(),
-                q_count[dst]*sizeof(float), cudaMemcpyDeviceToDevice, ctx.stream()));
+    if (equal_heads) {
+        NCCL_CHECK(ncclGroupStart());
+        for (size_t r = 0; r < n_backends; ++r) {
+            ggml_backend_cuda_context & ctx = get_cuda_context(backends[r]);
+            ggml_cuda_set_device(ctx.device);
+            NCCL_CHECK(ncclAllGather(q_local[r].get(), q_gathered[r].get(),
+                    q_count[r], ncclFloat, comms[r], ctx.stream()));
+        }
         if (has_sinks) {
-            CUDA_CHECK(cudaMemcpyAsync(sinks_full[dst].get() + heads.head_start[dst],
-                    graph_node->nodes[dst]->src[4]->data,
-                    heads.head_count[dst]*sizeof(float), cudaMemcpyDeviceToDevice, ctx.stream()));
+            for (size_t r = 0; r < n_backends; ++r) {
+                ggml_backend_cuda_context & ctx = get_cuda_context(backends[r]);
+                ggml_cuda_set_device(ctx.device);
+                NCCL_CHECK(ncclAllGather(graph_node->nodes[r]->src[4]->data, sinks_full[r].get(),
+                        heads.head_count[r], ncclFloat, comms[r], ctx.stream()));
+            }
         }
-    }
-
-    NCCL_CHECK(ncclGroupStart());
-    for (size_t src = 0; src < n_backends; ++src) {
+        NCCL_CHECK(ncclGroupEnd());
+    } else {
         for (size_t dst = 0; dst < n_backends; ++dst) {
-            if (src == dst) {
-                continue;
-            }
-            ggml_backend_cuda_context & src_ctx = get_cuda_context(backends[src]);
-            ggml_backend_cuda_context & dst_ctx = get_cuda_context(backends[dst]);
-            ggml_cuda_set_device(src_ctx.device);
-            NCCL_CHECK(ncclSend(q_local[src].get(), q_count[src], ncclFloat, dst, comms[src], src_ctx.stream()));
+            ggml_backend_cuda_context & ctx = get_cuda_context(backends[dst]);
+            ggml_cuda_set_device(ctx.device);
+            CUDA_CHECK(cudaMemcpyAsync(q_gathered[dst].get() + q_offset[dst], q_local[dst].get(),
+                    q_count[dst]*sizeof(float), cudaMemcpyDeviceToDevice, ctx.stream()));
             if (has_sinks) {
-                NCCL_CHECK(ncclSend(graph_node->nodes[src]->src[4]->data,
-                        heads.head_count[src], ncclFloat, dst, comms[src], src_ctx.stream()));
-            }
-            ggml_cuda_set_device(dst_ctx.device);
-            NCCL_CHECK(ncclRecv(q_gathered[dst].get() + q_offset[src], q_count[src],
-                    ncclFloat, src, comms[dst], dst_ctx.stream()));
-            if (has_sinks) {
-                NCCL_CHECK(ncclRecv(sinks_full[dst].get() + heads.head_start[src], heads.head_count[src],
-                        ncclFloat, src, comms[dst], dst_ctx.stream()));
+                CUDA_CHECK(cudaMemcpyAsync(sinks_full[dst].get() + heads.head_start[dst],
+                        graph_node->nodes[dst]->src[4]->data,
+                        heads.head_count[dst]*sizeof(float), cudaMemcpyDeviceToDevice, ctx.stream()));
             }
         }
+
+        NCCL_CHECK(ncclGroupStart());
+        for (size_t src = 0; src < n_backends; ++src) {
+            for (size_t dst = 0; dst < n_backends; ++dst) {
+                if (src == dst) {
+                    continue;
+                }
+                ggml_backend_cuda_context & src_ctx = get_cuda_context(backends[src]);
+                ggml_backend_cuda_context & dst_ctx = get_cuda_context(backends[dst]);
+                ggml_cuda_set_device(src_ctx.device);
+                NCCL_CHECK(ncclSend(q_local[src].get(), q_count[src], ncclFloat, dst, comms[src], src_ctx.stream()));
+                if (has_sinks) {
+                    NCCL_CHECK(ncclSend(graph_node->nodes[src]->src[4]->data,
+                            heads.head_count[src], ncclFloat, dst, comms[src], src_ctx.stream()));
+                }
+                ggml_cuda_set_device(dst_ctx.device);
+                NCCL_CHECK(ncclRecv(q_gathered[dst].get() + q_offset[src], q_count[src],
+                        ncclFloat, src, comms[dst], dst_ctx.stream()));
+                if (has_sinks) {
+                    NCCL_CHECK(ncclRecv(sinks_full[dst].get() + heads.head_start[src], heads.head_count[src],
+                            ncclFloat, src, comms[dst], dst_ctx.stream()));
+                }
+            }
+        }
+        NCCL_CHECK(ncclGroupEnd());
     }
-    NCCL_CHECK(ncclGroupEnd());
 
     for (size_t r = 0; r < n_backends; ++r) {
         ggml_backend_cuda_context & ctx = get_cuda_context(backends[r]);
         ggml_cuda_set_device(ctx.device);
         ggml_tensor * node = graph_node->nodes[r];
-        launch_1d(q_elements, ctx.stream(), unpack_q,
-                q_gathered[r].get(), q_full[r].get(), heads, q_dim, n_query, n_stream);
+        float * q_data = q_gathered[r].get();
+        if (n_stream > 1) {
+            q_data = q_full[r].get();
+            launch_1d(q_elements, ctx.stream(), unpack_q,
+                    q_gathered[r].get(), q_data, heads, q_dim, n_query, n_stream);
+        }
 
         memset(&q_tensors[r], 0, sizeof(q_tensors[r]));
         set_contiguous_tensor(q_tensors[r], GGML_TYPE_F32,
-                q_dim, n_query, n_head, n_stream, q_full[r].get());
+                q_dim, n_query, n_head, n_stream, q_data);
 
         if (has_sinks) {
             memset(&sink_tensors[r], 0, sizeof(sink_tensors[r]));
@@ -554,55 +650,102 @@ static bool execute_flash_attn(
         float2 * meta = fa_meta[r].alloc(ctx.pool(), out_rows);
         ggml_cuda_flash_attn_ext_partial(ctx, &fa_nodes[r], meta);
 
-        float * packed_part = packed_parts[r].alloc(ctx.pool(), out_elements);
-        float2 * packed_m = packed_meta[r].alloc(ctx.pool(), out_rows);
-        launch_1d(out_elements, ctx.stream(), pack_attention_parts,
-                (const float *) fa_nodes[r].data, meta, packed_part, packed_m,
-                heads, value_dim, n_query, n_stream);
+        if (equal_heads) {
+            float * max_data = global_max[r].alloc(ctx.pool(), out_rows);
+            launch_1d(out_rows, ctx.stream(), extract_attention_max, meta, max_data, out_rows);
+        } else {
+            float * packed_part = packed_parts[r].alloc(ctx.pool(), out_elements);
+            float2 * packed_m = packed_meta[r].alloc(ctx.pool(), out_rows);
+            launch_1d(out_elements, ctx.stream(), pack_attention_parts,
+                    (const float *) fa_nodes[r].data, meta, packed_part, packed_m,
+                    heads, value_dim, n_query, n_stream);
 
-        const int64_t local_elements = value_dim*heads.head_count[r]*n_query*n_stream;
-        const int64_t local_rows = heads.head_count[r]*n_query*n_stream;
-        received_parts[r].alloc(ctx.pool(), n_backends*local_elements);
-        received_meta[r].alloc(ctx.pool(), n_backends*local_rows);
-        CUDA_CHECK(cudaMemcpyAsync(received_parts[r].get() + r*local_elements,
-                packed_part + heads.elem_offset[r], local_elements*sizeof(float),
-                cudaMemcpyDeviceToDevice, ctx.stream()));
-        CUDA_CHECK(cudaMemcpyAsync(received_meta[r].get() + r*local_rows,
-                packed_m + heads.row_offset[r], local_rows*sizeof(float2),
-                cudaMemcpyDeviceToDevice, ctx.stream()));
-    }
-
-    NCCL_CHECK(ncclGroupStart());
-    for (size_t src = 0; src < n_backends; ++src) {
-        for (size_t dst = 0; dst < n_backends; ++dst) {
-            if (src == dst) {
-                continue;
-            }
-            const int64_t dst_elements = value_dim*heads.head_count[dst]*n_query*n_stream;
-            const int64_t dst_rows = heads.head_count[dst]*n_query*n_stream;
-            ggml_backend_cuda_context & src_ctx = get_cuda_context(backends[src]);
-            ggml_backend_cuda_context & dst_ctx = get_cuda_context(backends[dst]);
-            ggml_cuda_set_device(src_ctx.device);
-            NCCL_CHECK(ncclSend(packed_parts[src].get() + heads.elem_offset[dst], dst_elements,
-                    ncclFloat, dst, comms[src], src_ctx.stream()));
-            NCCL_CHECK(ncclSend(packed_meta[src].get() + heads.row_offset[dst], 2*dst_rows,
-                    ncclFloat, dst, comms[src], src_ctx.stream()));
-            ggml_cuda_set_device(dst_ctx.device);
-            NCCL_CHECK(ncclRecv(received_parts[dst].get() + src*dst_elements, dst_elements,
-                    ncclFloat, src, comms[dst], dst_ctx.stream()));
-            NCCL_CHECK(ncclRecv(received_meta[dst].get() + src*dst_rows, 2*dst_rows,
-                    ncclFloat, src, comms[dst], dst_ctx.stream()));
+            const int64_t local_elements = value_dim*heads.head_count[r]*n_query*n_stream;
+            const int64_t local_rows = heads.head_count[r]*n_query*n_stream;
+            received_parts[r].alloc(ctx.pool(), n_backends*local_elements);
+            received_meta[r].alloc(ctx.pool(), n_backends*local_rows);
+            CUDA_CHECK(cudaMemcpyAsync(received_parts[r].get() + r*local_elements,
+                    packed_part + heads.elem_offset[r], local_elements*sizeof(float),
+                    cudaMemcpyDeviceToDevice, ctx.stream()));
+            CUDA_CHECK(cudaMemcpyAsync(received_meta[r].get() + r*local_rows,
+                    packed_m + heads.row_offset[r], local_rows*sizeof(float2),
+                    cudaMemcpyDeviceToDevice, ctx.stream()));
         }
     }
-    NCCL_CHECK(ncclGroupEnd());
 
-    for (size_t r = 0; r < n_backends; ++r) {
-        ggml_backend_cuda_context & ctx = get_cuda_context(backends[r]);
-        ggml_cuda_set_device(ctx.device);
-        const int64_t local_rows = heads.head_count[r]*n_query*n_stream;
-        launch_1d(value_dim*local_rows, ctx.stream(), combine_attention_parts,
-                received_parts[r].get(), received_meta[r].get(),
-                (float *) graph_node->nodes[r]->data, n_backends, value_dim, local_rows);
+    if (equal_heads) {
+        NCCL_CHECK(ncclGroupStart());
+        for (size_t r = 0; r < n_backends; ++r) {
+            ggml_backend_cuda_context & ctx = get_cuda_context(backends[r]);
+            ggml_cuda_set_device(ctx.device);
+            NCCL_CHECK(ncclAllReduce(global_max[r].get(), global_max[r].get(),
+                    out_rows, ncclFloat, ncclMax, comms[r], ctx.stream()));
+        }
+        NCCL_CHECK(ncclGroupEnd());
+
+        const int64_t heads_per_rank = heads.head_count[0];
+        const int64_t local_rows = heads_per_rank*n_query*n_stream;
+        const int64_t reduction_count = local_rows*(value_dim + 1);
+        GGML_ASSERT(heads_per_rank*(int64_t) n_backends == n_head);
+        for (size_t r = 0; r < n_backends; ++r) {
+            ggml_backend_cuda_context & ctx = get_cuda_context(backends[r]);
+            ggml_cuda_set_device(ctx.device);
+            float * packed = packed_reduction[r].alloc(ctx.pool(), n_backends*reduction_count);
+            reduced_reduction[r].alloc(ctx.pool(), reduction_count);
+            launch_1d(out_elements, ctx.stream(), pack_attention_reduction,
+                    (const float *) fa_nodes[r].data, fa_meta[r].get(), global_max[r].get(), packed,
+                    n_head, heads_per_rank, value_dim, n_query, n_stream);
+        }
+
+        NCCL_CHECK(ncclGroupStart());
+        for (size_t r = 0; r < n_backends; ++r) {
+            ggml_backend_cuda_context & ctx = get_cuda_context(backends[r]);
+            ggml_cuda_set_device(ctx.device);
+            NCCL_CHECK(ncclReduceScatter(packed_reduction[r].get(), reduced_reduction[r].get(),
+                    reduction_count, ncclFloat, ncclSum, comms[r], ctx.stream()));
+        }
+        NCCL_CHECK(ncclGroupEnd());
+
+        for (size_t r = 0; r < n_backends; ++r) {
+            ggml_backend_cuda_context & ctx = get_cuda_context(backends[r]);
+            ggml_cuda_set_device(ctx.device);
+            launch_1d(value_dim*local_rows, ctx.stream(), normalize_attention_reduction,
+                    reduced_reduction[r].get(), (float *) graph_node->nodes[r]->data,
+                    value_dim, local_rows);
+        }
+    } else {
+        NCCL_CHECK(ncclGroupStart());
+        for (size_t src = 0; src < n_backends; ++src) {
+            for (size_t dst = 0; dst < n_backends; ++dst) {
+                if (src == dst) {
+                    continue;
+                }
+                const int64_t dst_elements = value_dim*heads.head_count[dst]*n_query*n_stream;
+                const int64_t dst_rows = heads.head_count[dst]*n_query*n_stream;
+                ggml_backend_cuda_context & src_ctx = get_cuda_context(backends[src]);
+                ggml_backend_cuda_context & dst_ctx = get_cuda_context(backends[dst]);
+                ggml_cuda_set_device(src_ctx.device);
+                NCCL_CHECK(ncclSend(packed_parts[src].get() + heads.elem_offset[dst], dst_elements,
+                        ncclFloat, dst, comms[src], src_ctx.stream()));
+                NCCL_CHECK(ncclSend(packed_meta[src].get() + heads.row_offset[dst], 2*dst_rows,
+                        ncclFloat, dst, comms[src], src_ctx.stream()));
+                ggml_cuda_set_device(dst_ctx.device);
+                NCCL_CHECK(ncclRecv(received_parts[dst].get() + src*dst_elements, dst_elements,
+                        ncclFloat, src, comms[dst], dst_ctx.stream()));
+                NCCL_CHECK(ncclRecv(received_meta[dst].get() + src*dst_rows, 2*dst_rows,
+                        ncclFloat, src, comms[dst], dst_ctx.stream()));
+            }
+        }
+        NCCL_CHECK(ncclGroupEnd());
+
+        for (size_t r = 0; r < n_backends; ++r) {
+            ggml_backend_cuda_context & ctx = get_cuda_context(backends[r]);
+            ggml_cuda_set_device(ctx.device);
+            const int64_t local_rows = heads.head_count[r]*n_query*n_stream;
+            launch_1d(value_dim*local_rows, ctx.stream(), combine_attention_parts,
+                    received_parts[r].get(), received_meta[r].get(),
+                    (float *) graph_node->nodes[r]->data, n_backends, value_dim, local_rows);
+        }
     }
     CUDA_CHECK(cudaGetLastError());
     return true;

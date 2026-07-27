@@ -355,6 +355,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_qk_norm         ("blk\\.\\d*\\.attn_(q|k)_norm\\.weight");
     static const std::regex pattern_kv_cache         ("cache_(k|v)_l\\d*");
     static const std::regex pattern_dsv4_state       ("dsv4_(csa|hca|lid)_state_(kv|score)_l\\d*");
+    static const std::regex pattern_dsv4_input       ("(attn_inp_|dsv4_(csa|hca|lid))");
     static const std::regex pattern_dsv4_kq_mask     ("kq_mask");
     static const std::regex pattern_attn_sinks       ("blk\\.\\d*\\.attn_sinks.weight");
     static const std::regex pattern_attn_out_weight  ("blk\\.\\d*\\.attn_output.weight");
@@ -364,23 +365,26 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_attn_q_b_weight  ("blk\\.\\d*\\.attn_q_b\\.weight");
     static const std::regex pattern_attn_gate_weight ("blk\\.\\d*\\.attn_gate.weight");
 
-    if (ud->model->arch == LLM_ARCH_DEEPSEEK4 && llama_dsv4_kv_distributed_requested() &&
-            (std::regex_match(tensor_name, pattern_kv_cache) ||
-             std::regex_search(tensor_name, pattern_dsv4_kq_mask))) {
+    if (ud->model->arch == LLM_ARCH_DEEPSEEK4 && llama_dsv4_kv_distributed_requested()) {
         GGML_ASSERT(ud->n_devices > 1);
-        const bool is_mask = std::regex_search(tensor_name, pattern_dsv4_kq_mask);
-        const int axis = is_mask ? 0 : 1;
         const uint32_t n_round = LLAMA_DSV4_KV_PAGE_SIZE*ud->n_devices;
-        GGML_ASSERT(tensor->ne[axis] % n_round == 0);
+        const bool is_mask = std::regex_search(tensor_name, pattern_dsv4_kq_mask) ||
+                ((tensor->flags & GGML_TENSOR_FLAG_INPUT) != 0 && tensor->type == GGML_TYPE_F16 &&
+                 std::regex_search(tensor_name, pattern_dsv4_input) &&
+                 tensor->ne[0] >= n_round && tensor->ne[0] % n_round == 0);
+        if (std::regex_match(tensor_name, pattern_kv_cache) || is_mask) {
+            const int axis = is_mask ? 0 : 1;
+            GGML_ASSERT(tensor->ne[axis] % n_round == 0);
 
-        ggml_backend_meta_split_state split_state = {};
-        split_state.axis = (ggml_backend_meta_split_axis) axis;
-        for (size_t j = 0; j < ud->n_devices; ++j) {
-            split_state.ne[j] = LLAMA_DSV4_KV_PAGE_SIZE;
+            ggml_backend_meta_split_state split_state = {};
+            split_state.axis = (ggml_backend_meta_split_axis) axis;
+            for (size_t j = 0; j < ud->n_devices; ++j) {
+                split_state.ne[j] = LLAMA_DSV4_KV_PAGE_SIZE;
+            }
+            split_state.nr[0] = tensor->ne[axis]/n_round;
+            split_state.n_segments = 1;
+            return split_state;
         }
-        split_state.nr[0] = tensor->ne[axis]/n_round;
-        split_state.n_segments = 1;
-        return split_state;
     }
 
     static const std::regex pattern_ssm_dt          ("blk\\.\\d*\\.ssm_dt.bias");

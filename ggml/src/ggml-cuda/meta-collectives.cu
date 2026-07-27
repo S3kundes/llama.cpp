@@ -3,8 +3,6 @@
 #ifdef GGML_USE_NCCL
 
 #include "fattn.cuh"
-#include "lightning-indexer.cuh"
-#include "set-rows.cuh"
 #include "top-k.cuh"
 
 #include "ggml-backend-impl.h"
@@ -232,6 +230,19 @@ static __global__ void pack_attention_parts(
     }
 }
 
+static __global__ void pack_attention_sinks(
+        const float * src,
+        float * dst,
+        int64_t head_start,
+        int64_t head_count,
+        int64_t n_head) {
+    const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (i >= n_head) {
+        return;
+    }
+    dst[i] = i >= head_start && i < head_start + head_count ? src[i - head_start] : -FLT_MAX;
+}
+
 static __global__ void extract_attention_max(
         const float2 * src,
         float * dst,
@@ -332,11 +343,10 @@ static __global__ void combine_attention_parts(
     dst[i] = denominator > 0.0f ? numerator/denominator : 0.0f;
 }
 
-static __global__ void gather_top_k_candidates(
+static __global__ void pack_top_k_candidates(
         const float * scores,
         const int32_t * local_indices,
-        float * candidate_scores,
-        int32_t * candidate_indices,
+        uint64_t * candidate_pairs,
         meta_sequence_layout layout,
         int64_t local_k,
         int64_t n_candidates,
@@ -348,16 +358,13 @@ static __global__ void gather_top_k_candidates(
     }
     const int64_t row = i/n_candidates;
     const int32_t local = local_indices[i];
-    if (local < 0 || local >= local_k) {
-        return;
-    }
-    candidate_scores[i] = scores[row*local_k + local];
-    candidate_indices[i] = (int32_t) sequence_local_to_global(layout, local);
+    const float score = local >= 0 && local < local_k ? scores[row*local_k + local] : -FLT_MAX;
+    const int32_t index = local >= 0 && local < local_k ? (int32_t) sequence_local_to_global(layout, local) : -1;
+    candidate_pairs[i] = uint64_t(uint32_t(index)) << 32 | __float_as_uint(score);
 }
 
 static __global__ void reorder_top_k_candidates(
-        const float * scores_in,
-        const int32_t * indices_in,
+        const uint64_t * pairs_in,
         float * scores_out,
         int32_t * indices_out,
         int n_ranks,
@@ -376,8 +383,9 @@ static __global__ void reorder_top_k_candidates(
     const int64_t row = tmp/n_ranks;
     const int64_t src = (rank*n_rows + row)*n_candidates + candidate;
     const int64_t dst = row*(n_ranks*n_candidates) + rank*n_candidates + candidate;
-    scores_out[dst] = scores_in[src];
-    indices_out[dst] = indices_in[src];
+    const uint64_t pair = pairs_in[src];
+    scores_out[dst] = __uint_as_float(uint32_t(pair));
+    indices_out[dst] = int32_t(uint32_t(pair >> 32));
 }
 
 template<typename Kernel, typename... Args>
@@ -386,37 +394,6 @@ static void launch_1d(int64_t n, cudaStream_t stream, Kernel kernel, Args... arg
     const int blocks = (n + threads - 1)/threads;
     const ggml_cuda_kernel_launch_params params(dim3(blocks), dim3(threads), 0, stream);
     ggml_cuda_kernel_launch(kernel, params, args...);
-}
-
-static bool execute_set_rows(
-        ggml_backend_t * backends,
-        size_t n_backends,
-        const ggml_backend_comm_graph_node * graph_node) {
-    const auto & split = graph_node->src[2];
-    GGML_ASSERT(split.axis == GGML_BACKEND_SPLIT_AXIS_1 && split.n_segments == 1);
-    const int64_t page_size = split.ne[0];
-    for (size_t r = 0; r < n_backends; ++r) {
-        GGML_ASSERT(split.ne[r] == page_size);
-        ggml_backend_cuda_context & ctx = get_cuda_context(backends[r]);
-        ggml_cuda_set_device(ctx.device);
-        ggml_cuda_op_set_rows_sharded(ctx, graph_node->nodes[r], r, n_backends, page_size);
-    }
-    return true;
-}
-
-static bool execute_lightning_indexer(
-        ggml_backend_t * backends,
-        size_t n_backends,
-        const ggml_backend_comm_graph_node * graph_node) {
-    for (size_t r = 0; r < n_backends; ++r) {
-        ggml_backend_cuda_context & ctx = get_cuda_context(backends[r]);
-        ggml_cuda_set_device(ctx.device);
-        ggml_tensor * node = graph_node->nodes[r];
-        GGML_ASSERT(node->src[3]->ne[0] == node->src[1]->ne[2]);
-        ggml_cuda_lightning_indexer(ctx, node);
-    }
-    CUDA_CHECK(cudaGetLastError());
-    return true;
 }
 
 static bool execute_top_k(
@@ -432,10 +409,8 @@ static bool execute_top_k(
     GGML_ASSERT(n_candidates_all >= k);
 
     std::array<ggml_cuda_pool_alloc<int32_t>, GGML_CUDA_MAX_DEVICES> local_indices;
-    std::array<ggml_cuda_pool_alloc<float>, GGML_CUDA_MAX_DEVICES> candidate_scores;
-    std::array<ggml_cuda_pool_alloc<int32_t>, GGML_CUDA_MAX_DEVICES> candidate_indices;
-    std::array<ggml_cuda_pool_alloc<float>, GGML_CUDA_MAX_DEVICES> gathered_scores;
-    std::array<ggml_cuda_pool_alloc<int32_t>, GGML_CUDA_MAX_DEVICES> gathered_indices;
+    std::array<ggml_cuda_pool_alloc<uint64_t>, GGML_CUDA_MAX_DEVICES> candidate_pairs;
+    std::array<ggml_cuda_pool_alloc<uint64_t>, GGML_CUDA_MAX_DEVICES> gathered_pairs;
     std::array<ggml_cuda_pool_alloc<float>, GGML_CUDA_MAX_DEVICES> ordered_scores;
     std::array<ggml_cuda_pool_alloc<int32_t>, GGML_CUDA_MAX_DEVICES> ordered_indices;
     std::array<ggml_tensor, GGML_CUDA_MAX_DEVICES> local_nodes;
@@ -454,15 +429,13 @@ static bool execute_top_k(
         local_nodes[r].src[0] = node->src[0];
         ggml_cuda_op_top_k(ctx, &local_nodes[r]);
 
-        float * score_data = candidate_scores[r].alloc(ctx.pool(), n_candidates*n_rows);
-        int32_t * index_data = candidate_indices[r].alloc(ctx.pool(), n_candidates*n_rows);
+        uint64_t * pairs = candidate_pairs[r].alloc(ctx.pool(), n_candidates*n_rows);
         const meta_sequence_layout layout = make_sequence_layout(graph_node->src[0], n_backends, r);
-        launch_1d(n_candidates*n_rows, ctx.stream(), gather_top_k_candidates,
-                (const float *) node->src[0]->data, local_data, score_data, index_data,
+        launch_1d(n_candidates*n_rows, ctx.stream(), pack_top_k_candidates,
+                (const float *) node->src[0]->data, local_data, pairs,
                 layout, local_k, n_candidates, n_rows);
 
-        gathered_scores[r].alloc(ctx.pool(), n_candidates_all*n_rows);
-        gathered_indices[r].alloc(ctx.pool(), n_candidates_all*n_rows);
+        gathered_pairs[r].alloc(ctx.pool(), n_candidates_all*n_rows);
         ordered_scores[r].alloc(ctx.pool(), n_candidates_all*n_rows);
         ordered_indices[r].alloc(ctx.pool(), n_candidates_all*n_rows);
     }
@@ -471,10 +444,8 @@ static bool execute_top_k(
     for (size_t r = 0; r < n_backends; ++r) {
         ggml_backend_cuda_context & ctx = get_cuda_context(backends[r]);
         ggml_cuda_set_device(ctx.device);
-        NCCL_CHECK(ncclAllGather(candidate_scores[r].get(), gathered_scores[r].get(),
-                n_candidates*n_rows, ncclFloat, comms[r], ctx.stream()));
-        NCCL_CHECK(ncclAllGather(candidate_indices[r].get(), gathered_indices[r].get(),
-                n_candidates*n_rows, ncclInt32, comms[r], ctx.stream()));
+        NCCL_CHECK(ncclAllGather(candidate_pairs[r].get(), gathered_pairs[r].get(),
+                n_candidates*n_rows*sizeof(uint64_t), ncclUint8, comms[r], ctx.stream()));
     }
     NCCL_CHECK(ncclGroupEnd());
 
@@ -482,8 +453,7 @@ static bool execute_top_k(
         ggml_backend_cuda_context & ctx = get_cuda_context(backends[r]);
         ggml_cuda_set_device(ctx.device);
         launch_1d(n_candidates_all*n_rows, ctx.stream(), reorder_top_k_candidates,
-                gathered_scores[r].get(), gathered_indices[r].get(),
-                ordered_scores[r].get(), ordered_indices[r].get(),
+                gathered_pairs[r].get(), ordered_scores[r].get(), ordered_indices[r].get(),
                 n_backends, n_candidates, n_rows);
         if (!ggml_cuda_top_k_stable_pairs(ctx,
                 ordered_scores[r].get(), ordered_indices[r].get(),
@@ -554,7 +524,10 @@ static bool execute_flash_attn(
             q_full[r].alloc(ctx.pool(), q_elements);
         }
         if (has_sinks) {
-            sinks_full[r].alloc(ctx.pool(), n_head);
+            float * sinks = sinks_full[r].alloc(ctx.pool(), n_head);
+            launch_1d(n_head, ctx.stream(), pack_attention_sinks,
+                    (const float *) graph_node->nodes[r]->src[4]->data, sinks,
+                    heads.head_start[r], heads.head_count[r], n_head);
         }
     }
     GGML_ASSERT(q_total == q_elements);
@@ -567,14 +540,6 @@ static bool execute_flash_attn(
             NCCL_CHECK(ncclAllGather(q_local[r].get(), q_gathered[r].get(),
                     q_count[r], ncclFloat, comms[r], ctx.stream()));
         }
-        if (has_sinks) {
-            for (size_t r = 0; r < n_backends; ++r) {
-                ggml_backend_cuda_context & ctx = get_cuda_context(backends[r]);
-                ggml_cuda_set_device(ctx.device);
-                NCCL_CHECK(ncclAllGather(graph_node->nodes[r]->src[4]->data, sinks_full[r].get(),
-                        heads.head_count[r], ncclFloat, comms[r], ctx.stream()));
-            }
-        }
         NCCL_CHECK(ncclGroupEnd());
     } else {
         for (size_t dst = 0; dst < n_backends; ++dst) {
@@ -582,11 +547,6 @@ static bool execute_flash_attn(
             ggml_cuda_set_device(ctx.device);
             CUDA_CHECK(cudaMemcpyAsync(q_gathered[dst].get() + q_offset[dst], q_local[dst].get(),
                     q_count[dst]*sizeof(float), cudaMemcpyDeviceToDevice, ctx.stream()));
-            if (has_sinks) {
-                CUDA_CHECK(cudaMemcpyAsync(sinks_full[dst].get() + heads.head_start[dst],
-                        graph_node->nodes[dst]->src[4]->data,
-                        heads.head_count[dst]*sizeof(float), cudaMemcpyDeviceToDevice, ctx.stream()));
-            }
         }
 
         NCCL_CHECK(ncclGroupStart());
@@ -599,17 +559,9 @@ static bool execute_flash_attn(
                 ggml_backend_cuda_context & dst_ctx = get_cuda_context(backends[dst]);
                 ggml_cuda_set_device(src_ctx.device);
                 NCCL_CHECK(ncclSend(q_local[src].get(), q_count[src], ncclFloat, dst, comms[src], src_ctx.stream()));
-                if (has_sinks) {
-                    NCCL_CHECK(ncclSend(graph_node->nodes[src]->src[4]->data,
-                            heads.head_count[src], ncclFloat, dst, comms[src], src_ctx.stream()));
-                }
                 ggml_cuda_set_device(dst_ctx.device);
                 NCCL_CHECK(ncclRecv(q_gathered[dst].get() + q_offset[src], q_count[src],
                         ncclFloat, src, comms[dst], dst_ctx.stream()));
-                if (has_sinks) {
-                    NCCL_CHECK(ncclRecv(sinks_full[dst].get() + heads.head_start[src], heads.head_count[src],
-                            ncclFloat, src, comms[dst], dst_ctx.stream()));
-                }
             }
         }
         NCCL_CHECK(ncclGroupEnd());
@@ -644,7 +596,7 @@ static bool execute_flash_attn(
         set_contiguous_tensor(fa_nodes[r], GGML_TYPE_F32,
                 value_dim, n_head, n_query, n_stream, nullptr);
         fa_nodes[r].src[0] = &q_tensors[r];
-        fa_nodes[r].src[4] = has_sinks && r == 0 ? &sink_tensors[r] : nullptr;
+        fa_nodes[r].src[4] = has_sinks ? &sink_tensors[r] : nullptr;
         const size_t fa_size = ggml_cuda_flash_attn_ext_partial_get_alloc_size(ctx.device, &fa_nodes[r]);
         fa_nodes[r].data = fa_storage[r].alloc(ctx.pool(), fa_size);
         float2 * meta = fa_meta[r].alloc(ctx.pool(), out_rows);
@@ -758,10 +710,6 @@ bool ggml_cuda_meta_execute_graph_node(
         const ggml_backend_comm_graph_node * node) {
     GGML_ASSERT(n_backends > 1 && n_backends <= GGML_BACKEND_META_MAX_DEVICES);
     switch (node->nodes[0]->op) {
-        case GGML_OP_SET_ROWS:
-            return execute_set_rows(backends, n_backends, node);
-        case GGML_OP_LIGHTNING_INDEXER:
-            return execute_lightning_indexer(backends, n_backends, node);
         case GGML_OP_TOP_K:
             return execute_top_k(backends, comms, n_backends, node);
         case GGML_OP_FLASH_ATTN_EXT:

@@ -1,6 +1,8 @@
 #include "set-rows.cuh"
 #include "cpy-utils.cuh"
 
+#include "ggml-backend-impl.h"
+
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
 
 // Generic quantized set_rows kernel template
@@ -374,6 +376,14 @@ void set_rows_cuda<half, int64_t>(ggml_backend_cuda_context & ctx, const ggml_te
 
 
 void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_backend_meta_set_rows_shard_params shard_params = {};
+    memcpy(&shard_params, dst->op_params, sizeof(shard_params));
+    if (shard_params.magic == GGML_BACKEND_META_SET_ROWS_SHARD_MAGIC) {
+        GGML_ASSERT(shard_params.rank >= 0 && shard_params.rank < shard_params.n_ranks && shard_params.page_size > 0);
+        ggml_cuda_op_set_rows_sharded(ctx, dst, shard_params.rank, shard_params.n_ranks, shard_params.page_size);
+        return;
+    }
+
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 

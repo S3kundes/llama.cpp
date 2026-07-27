@@ -10,6 +10,16 @@ extern "C" {
 
     #define GGML_BACKEND_API_VERSION 2
 
+    #define GGML_BACKEND_META_SET_ROWS_SHARD_MAGIC 0x4d535253u
+
+    struct ggml_backend_meta_set_rows_shard_params {
+        uint32_t magic;
+        int32_t  rank;
+        int32_t  n_ranks;
+        int32_t  reserved;
+        int64_t  page_size;
+    };
+
     //
     // Backend buffer type
     //

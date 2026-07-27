@@ -1334,6 +1334,25 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         }
         t_ij->flags = tensor->flags;
         memcpy(t_ij->op_params, tensor->op_params, sizeof(tensor->op_params));
+        if (tensor->op == GGML_OP_SET_ROWS) {
+            const ggml_backend_meta_split_state src0 = ggml_backend_meta_get_split_state(stc, tensor->src[0], true);
+            const ggml_backend_meta_split_state src1 = ggml_backend_meta_get_split_state(stc, tensor->src[1], true);
+            const ggml_backend_meta_split_state src2 = ggml_backend_meta_get_split_state(stc, tensor->src[2], true);
+            if (src0.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+                    src1.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+                    src2.axis == GGML_BACKEND_SPLIT_AXIS_1 && src2.n_segments == 1) {
+                GGML_ASSERT(src2.ne[j] == src2.ne[0]);
+                const ggml_backend_meta_set_rows_shard_params params = {
+                    GGML_BACKEND_META_SET_ROWS_SHARD_MAGIC,
+                    (int32_t) j,
+                    (int32_t) n_simple_bufs,
+                    0,
+                    src2.ne[0],
+                };
+                static_assert(sizeof(params) <= GGML_MAX_OP_PARAMS, "SET_ROWS shard parameters do not fit");
+                memcpy(t_ij->op_params, &params, sizeof(params));
+            }
+        }
         ggml_set_name(t_ij, tensor->name);
         t_ij->buffer = simple_buf;
         t_ij->view_src = tensor->view_src;
@@ -2207,19 +2226,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         };
 
         switch (node->op) {
-            case GGML_OP_SET_ROWS:
-                return src_axis(0) == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
-                       src_axis(1) == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
-                       src_axis(2) == GGML_BACKEND_SPLIT_AXIS_1;
             case GGML_OP_FLASH_ATTN_EXT:
                 return src_axis(0) == GGML_BACKEND_SPLIT_AXIS_2 &&
                        src_axis(1) == GGML_BACKEND_SPLIT_AXIS_1 &&
                        src_axis(2) == GGML_BACKEND_SPLIT_AXIS_1 &&
-                       src_axis(3) == GGML_BACKEND_SPLIT_AXIS_0;
-            case GGML_OP_LIGHTNING_INDEXER:
-                return src_axis(0) == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
-                       src_axis(1) == GGML_BACKEND_SPLIT_AXIS_2 &&
-                       src_axis(2) == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
                        src_axis(3) == GGML_BACKEND_SPLIT_AXIS_0;
             case GGML_OP_TOP_K:
                 return src_axis(0) == GGML_BACKEND_SPLIT_AXIS_0;

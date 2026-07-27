@@ -369,8 +369,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         GGML_ASSERT(ud->n_devices > 1);
         const uint32_t n_round = LLAMA_DSV4_KV_PAGE_SIZE*ud->n_devices;
         const bool is_mask = std::regex_search(tensor_name, pattern_dsv4_kq_mask) ||
-                ((tensor->flags & GGML_TENSOR_FLAG_INPUT) != 0 && tensor->type == GGML_TYPE_F16 &&
-                 std::regex_search(tensor_name, pattern_dsv4_input) &&
+                (tensor->type == GGML_TYPE_F16 && std::regex_search(tensor_name, pattern_dsv4_input) &&
                  tensor->ne[0] >= n_round && tensor->ne[0] % n_round == 0);
         if (std::regex_match(tensor_name, pattern_kv_cache) || is_mask) {
             const int axis = is_mask ? 0 : 1;

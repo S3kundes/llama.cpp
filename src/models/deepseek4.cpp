@@ -785,7 +785,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_raw_attention(
 
     ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, kv, inp_attn->get_k_idxs(), il));
 
-    ggml_tensor * kq_mask = inp_attn->get_kq_mask();
+    ggml_tensor * kq_mask = hparams.dsv4_compress_ratios[il] == 0 ?
+            inp_attn->get_kq_mask_mirrored() : inp_attn->get_kq_mask();
 
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
 

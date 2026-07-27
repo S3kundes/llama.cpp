@@ -686,7 +686,8 @@ static ggml_tensor * dsv4_build_raw_kq_mask(
         const llama_kv_cache_dsv4_raw_context * mctx,
         const llama_ubatch & ubatch,
         const llama_cparams & cparams,
-        int64_t n_stream) {
+        int64_t n_stream,
+        const char * name) {
     const auto n_kv     = mctx->get_n_kv();
     const auto n_tokens = ubatch.n_tokens;
 
@@ -697,7 +698,7 @@ static ggml_tensor * dsv4_build_raw_kq_mask(
 
     ggml_tensor * res = ggml_new_tensor_4d(ctx, type, n_kv, n_tokens/n_stream, 1, n_stream);
     ggml_set_input(res);
-    ggml_set_name(res, "attn_inp_kq_mask");
+    ggml_set_name(res, name);
 
     return res;
 }
@@ -856,6 +857,9 @@ void llm_graph_input_dsv4_raw::set_input(const llama_ubatch * ubatch) {
     if (self_kq_mask && self_kq_mask->buffer) {
         mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
     }
+    if (self_kq_mask_dist && self_kq_mask_dist->buffer) {
+        mctx->set_input_kq_mask(self_kq_mask_dist, ubatch, cparams.causal_attn);
+    }
 
     if (self_k_rot) {
         mctx->set_input_k_rot(self_k_rot);
@@ -909,6 +913,9 @@ bool llm_graph_input_dsv4::can_reuse(const llm_graph_params & params) {
     }
     if (inp_raw->self_kq_mask && inp_raw->self_kq_mask->buffer) {
         res &= dsv4_can_reuse_raw_kq_mask(inp_raw->self_kq_mask, raw_ctx, params.ubatch, n_stream);
+    }
+    if (inp_raw->self_kq_mask_dist && inp_raw->self_kq_mask_dist->buffer) {
+        res &= dsv4_can_reuse_raw_kq_mask(inp_raw->self_kq_mask_dist, raw_ctx, params.ubatch, n_stream);
     }
 
     res &= dsv4_can_reuse_comp_input(inp_csa, plan_csa, params.ubatch.n_tokens, n_stream);
@@ -3084,8 +3091,10 @@ llm_graph_input_dsv4 * llm_graph_context::build_inp_dsv4() const {
     GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE && "DSV4 expects SWA raw cache");
 
     inp_raw->self_k_idxs = raw_ctx->build_input_k_idxs(ctx0, ubatch);
-    inp_raw->self_kq_mask = dsv4_build_raw_kq_mask(ctx0, raw_ctx, ubatch, cparams, n_stream);
+    inp_raw->self_kq_mask = dsv4_build_raw_kq_mask(ctx0, raw_ctx, ubatch, cparams, n_stream, "dsv4_raw_kq_mask");
     inp_raw->self_kq_mask_cnv = inp_raw->self_kq_mask;
+    inp_raw->self_kq_mask_dist = dsv4_build_raw_kq_mask(ctx0, raw_ctx, ubatch, cparams, n_stream, "dsv4_raw_dist_kq_mask");
+    inp_raw->self_kq_mask_dist_cnv = inp_raw->self_kq_mask_dist;
 
     inp_raw->self_k_rot = raw_ctx->build_input_k_rot(ctx0);
     auto inp = std::make_unique<llm_graph_input_dsv4>(cparams, std::move(inp_raw), mctx_cur);

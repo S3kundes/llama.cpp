@@ -355,8 +355,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_qk_norm         ("blk\\.\\d*\\.attn_(q|k)_norm\\.weight");
     static const std::regex pattern_kv_cache         ("cache_(k|v)_l\\d*");
     static const std::regex pattern_dsv4_state       ("dsv4_(csa|hca|lid)_state_(kv|score)_l\\d*");
-    static const std::regex pattern_dsv4_input       ("(attn_inp_|dsv4_(csa|hca|lid))");
+    static const std::regex pattern_dsv4_input       ("(attn_inp_|dsv4_(csa|hca|lid|raw_dist))");
     static const std::regex pattern_dsv4_kq_mask     ("kq_mask");
+    static const std::regex pattern_dsv4_raw_kq_mask ("dsv4_raw_kq_mask");
     static const std::regex pattern_attn_sinks       ("blk\\.\\d*\\.attn_sinks.weight");
     static const std::regex pattern_attn_out_weight  ("blk\\.\\d*\\.attn_output.weight");
     static const std::regex pattern_attn_out_bias    ("blk\\.\\d*\\.attn_output.bias");
@@ -367,6 +368,17 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
     if (ud->model->arch == LLM_ARCH_DEEPSEEK4 && llama_dsv4_kv_distributed_requested()) {
         GGML_ASSERT(ud->n_devices > 1);
+        if (std::regex_match(tensor_name, pattern_dsv4_raw_kq_mask)) {
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+        }
+        if (std::regex_match(tensor_name, pattern_kv_cache)) {
+            const size_t layer_index_start = tensor_name.find("_l", 6);
+            GGML_ASSERT(layer_index_start != std::string::npos);
+            const uint32_t il = std::stoull(tensor_name.substr(layer_index_start + 2));
+            if (hparams.dsv4_compress_ratios[il] == 0) {
+                return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+            }
+        }
         const uint32_t page_size = llama_dsv4_kv_page_size(ud->n_devices);
         const uint32_t n_round = page_size*ud->n_devices;
         const bool is_mask = std::regex_search(tensor_name, pattern_dsv4_kq_mask) ||
@@ -2330,6 +2342,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         if (distributed) {
                             LLAMA_LOG_INFO("%s: distributing DSV4 KV cache in %u-row rounds across %u devices\n",
                                     __func__, n_pad, n_devices);
+                            LLAMA_LOG_INFO("%s: keeping bounded raw-only SWA cache layers mirrored\n", __func__);
                         }
 
                         res = new llama_kv_cache_dsv4(

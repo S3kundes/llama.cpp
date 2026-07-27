@@ -1186,6 +1186,11 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
     ncclResult_t rc = ncclCommInitAll(ret->comms.data(), (int) n, ret->dev_ids.data());
     if (rc == ncclSuccess) {
         ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_nccl;
+#if NCCL_VERSION_CODE >= 22800
+        GGML_LOG_INFO("NCCL attention partial routing: native all-to-all\n");
+#else
+        GGML_LOG_INFO("NCCL attention partial routing: grouped point-to-point\n");
+#endif
         return;
     }
 

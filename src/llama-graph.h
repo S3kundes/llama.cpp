@@ -485,12 +485,15 @@ public:
     void set_input(const llama_ubatch * ubatch);
 
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
-    ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
+    ggml_tensor * get_kq_mask() const { return self_kq_mask_dist_cnv; }
+    ggml_tensor * get_kq_mask_mirrored() const { return self_kq_mask_cnv; }
 
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
 
-    ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
-    ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * self_kq_mask          = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * self_kq_mask_cnv      = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * self_kq_mask_dist     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * self_kq_mask_dist_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
 
     ggml_tensor * self_k_rot = nullptr;
 

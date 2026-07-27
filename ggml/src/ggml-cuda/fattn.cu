@@ -6,6 +6,7 @@
 #include "fattn.cuh"
 
 thread_local float2 * ggml_cuda_fattn_final_meta = nullptr;
+static thread_local bool ggml_cuda_fattn_unpadded_gqa = false;
 
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -47,9 +48,10 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     float max_bias = 0.0f;
     memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
 
-    // Edge cases like no mask, ALiBi, unpadded K/V, or misaligned addresses for large data transfers
-    //     are put into the template specialization without GQA optimizations.
-    bool use_gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    // Edge cases like no mask, ALiBi, unpadded K/V, or misaligned addresses use the specialization without GQA optimizations.
+    // Distributed partial FA opts in with tile-aligned local K/V.
+    bool use_gqa_opt = mask && max_bias == 0.0f &&
+            (K->ne[1] % FATTN_KQ_STRIDE == 0 || (ggml_cuda_fattn_unpadded_gqa && K->ne[1] % 32 == 0));
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
             continue;
@@ -377,7 +379,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // The effective batch size for the kernel can be increased by gqa_ratio.
     // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
-    bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f &&
+            (K->ne[1] % FATTN_KQ_STRIDE == 0 || (ggml_cuda_fattn_unpadded_gqa && K->ne[1] % 32 == 0));
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
             continue;
@@ -586,10 +589,20 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     }
 }
 
+size_t ggml_cuda_flash_attn_ext_partial_get_alloc_size(int device, const ggml_tensor * dst) {
+    GGML_ASSERT(!ggml_cuda_fattn_unpadded_gqa);
+    ggml_cuda_fattn_unpadded_gqa = true;
+    const size_t size = ggml_cuda_flash_attn_ext_get_alloc_size(device, dst);
+    ggml_cuda_fattn_unpadded_gqa = false;
+    return size;
+}
+
 void ggml_cuda_flash_attn_ext_partial(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float2 * meta) {
-    GGML_ASSERT(meta != nullptr && ggml_cuda_fattn_final_meta == nullptr);
+    GGML_ASSERT(meta != nullptr && ggml_cuda_fattn_final_meta == nullptr && !ggml_cuda_fattn_unpadded_gqa);
     ggml_cuda_fattn_final_meta = meta;
+    ggml_cuda_fattn_unpadded_gqa = true;
     ggml_cuda_flash_attn_ext(ctx, dst);
+    ggml_cuda_fattn_unpadded_gqa = false;
     ggml_cuda_fattn_final_meta = nullptr;
 }
 

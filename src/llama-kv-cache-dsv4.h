@@ -8,7 +8,13 @@
 #include <unordered_map>
 #include <vector>
 
-static constexpr uint32_t LLAMA_DSV4_KV_PAGE_SIZE = 256;
+static constexpr uint32_t LLAMA_DSV4_KV_MIN_ROUND_SIZE = 256;
+
+// keep the ordinary 256-row FA padding while distributing each round evenly
+static constexpr uint32_t llama_dsv4_kv_page_size(uint32_t n_devices) {
+    return n_devices > 0 && LLAMA_DSV4_KV_MIN_ROUND_SIZE % n_devices == 0 ?
+            LLAMA_DSV4_KV_MIN_ROUND_SIZE/n_devices : LLAMA_DSV4_KV_MIN_ROUND_SIZE;
+}
 
 class llama_dsv4_comp_state {
 public:

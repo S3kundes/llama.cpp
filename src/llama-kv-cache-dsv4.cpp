@@ -1036,7 +1036,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     distributed(distributed),
     n_pad(n_pad) {
 
-    GGML_ASSERT(!distributed || (n_devices > 1 && n_pad == LLAMA_DSV4_KV_PAGE_SIZE*n_devices));
+    GGML_ASSERT(!distributed || (n_devices > 1 && n_pad == llama_dsv4_kv_page_size(n_devices)*n_devices));
 
     const layer_filter_cb filter_raw = [&](int32_t il) {
         if (filter && !filter(il)) {

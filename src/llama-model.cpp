@@ -367,7 +367,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
     if (ud->model->arch == LLM_ARCH_DEEPSEEK4 && llama_dsv4_kv_distributed_requested()) {
         GGML_ASSERT(ud->n_devices > 1);
-        const uint32_t n_round = LLAMA_DSV4_KV_PAGE_SIZE*ud->n_devices;
+        const uint32_t page_size = llama_dsv4_kv_page_size(ud->n_devices);
+        const uint32_t n_round = page_size*ud->n_devices;
         const bool is_mask = std::regex_search(tensor_name, pattern_dsv4_kq_mask) ||
                 (tensor->type == GGML_TYPE_F16 && std::regex_search(tensor_name, pattern_dsv4_input) &&
                  tensor->ne[0] >= n_round && tensor->ne[0] % n_round == 0);
@@ -378,7 +379,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             ggml_backend_meta_split_state split_state = {};
             split_state.axis = (ggml_backend_meta_split_axis) axis;
             for (size_t j = 0; j < ud->n_devices; ++j) {
-                split_state.ne[j] = LLAMA_DSV4_KV_PAGE_SIZE;
+                split_state.ne[j] = page_size;
             }
             split_state.nr[0] = tensor->ne[axis]/n_round;
             split_state.n_segments = 1;
@@ -2324,7 +2325,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             throw std::runtime_error("distributed DeepSeek-V4 KV cache supports only F32, F16, and BF16 cache types");
                         }
 
-                        const uint32_t n_pad = distributed ? LLAMA_DSV4_KV_PAGE_SIZE*n_devices : 1;
+                        const uint32_t n_pad = distributed ? llama_dsv4_kv_page_size(n_devices)*n_devices : 1;
                         const uint32_t kv_size = GGML_PAD(cparams.n_ctx_seq, n_pad);
                         if (distributed) {
                             LLAMA_LOG_INFO("%s: distributing DSV4 KV cache in %u-row rounds across %u devices\n",

@@ -645,7 +645,7 @@ static bool execute_flash_attn(
                 value_dim, n_head, n_query, n_stream, nullptr);
         fa_nodes[r].src[0] = &q_tensors[r];
         fa_nodes[r].src[4] = has_sinks && r == 0 ? &sink_tensors[r] : nullptr;
-        const size_t fa_size = ggml_cuda_flash_attn_ext_get_alloc_size(ctx.device, &fa_nodes[r]);
+        const size_t fa_size = ggml_cuda_flash_attn_ext_partial_get_alloc_size(ctx.device, &fa_nodes[r]);
         fa_nodes[r].data = fa_storage[r].alloc(ctx.pool(), fa_size);
         float2 * meta = fa_meta[r].alloc(ctx.pool(), out_rows);
         ggml_cuda_flash_attn_ext_partial(ctx, &fa_nodes[r], meta);

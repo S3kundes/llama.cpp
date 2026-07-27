@@ -889,8 +889,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             split_layout_explicit = true;
             return ret;
         }
-        for (size_t i = 0; i < 4; i++) {
-            GGML_ASSERT(src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        if (src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED ||
+                src_ss[1].axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED ||
+                src_ss[2].axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED ||
+                src_ss[3].axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            GGML_ABORT("unsupported LIGHTNING_INDEXER split for %s: q=%s/%d k=%s/%d weights=%s/%d mask=%s/%d",
+                    tensor->name,
+                    tensor->src[0]->name, src_ss[0].axis,
+                    tensor->src[1]->name, src_ss[1].axis,
+                    tensor->src[2]->name, src_ss[2].axis,
+                    tensor->src[3]->name, src_ss[3].axis);
         }
         return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
     };

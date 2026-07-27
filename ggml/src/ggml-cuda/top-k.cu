@@ -1,6 +1,8 @@
 #include "argsort.cuh"
 #include "top-k.cuh"
 
+#include <climits>
+
 #ifdef GGML_CUDA_USE_CUB
 #    include <cub/cub.cuh>
 #    if (CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 2)
@@ -101,5 +103,71 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     argsort_f32_i32_cuda_bitonic(src0_d, tmp_dst, ncols, nrows, GGML_SORT_ORDER_DESC, stream);
     CUDA_CHECK(cudaMemcpy2DAsync(dst_d, k * sizeof(int), tmp_dst, ncols * sizeof(int), k * sizeof(int), nrows,
                                  cudaMemcpyDeviceToDevice, stream));
+#endif
+}
+
+#ifdef GGML_CUDA_USE_CUB
+static __global__ void top_k_pair_keys(
+        const float * scores, const int32_t * indices, uint64_t * keys, int64_t ncols) {
+    const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (i >= ncols) {
+        return;
+    }
+
+    const uint32_t bits = __float_as_uint(scores[i]);
+    const uint32_t ordered = bits & 0x80000000u ? ~bits : bits ^ 0x80000000u;
+    keys[i] = (uint64_t(ordered) << 32) | ~uint32_t(indices[i]);
+}
+
+static __global__ void top_k_pair_indices(const uint64_t * keys, int32_t * dst, int64_t k) {
+    const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (i < k) {
+        dst[i] = int32_t(~uint32_t(keys[i]));
+    }
+}
+#endif
+
+bool ggml_cuda_top_k_stable_pairs(
+        ggml_backend_cuda_context & ctx,
+        const float * scores,
+        const int32_t * indices,
+        int64_t ncols,
+        int64_t nrows,
+        int64_t k,
+        int32_t * dst) {
+#ifdef GGML_CUDA_USE_CUB
+    GGML_ASSERT(ncols >= k && k > 0 && ncols <= INT_MAX);
+    const int ncols_i = (int) ncols;
+    ggml_cuda_pool & pool = ctx.pool();
+    cudaStream_t stream = ctx.stream();
+    ggml_cuda_pool_alloc<uint64_t> keys_in(pool, ncols);
+    ggml_cuda_pool_alloc<uint64_t> keys_out(pool, ncols);
+
+    size_t temp_size = 0;
+    CUDA_CHECK(cub::DeviceRadixSort::SortKeysDescending(
+            nullptr, temp_size, keys_in.get(), keys_out.get(), ncols_i, 0, 64, stream));
+    ggml_cuda_pool_alloc<uint8_t> temp(pool, temp_size);
+
+    const int threads = 256;
+    const int blocks_keys = (ncols + threads - 1)/threads;
+    const int blocks_dst = (k + threads - 1)/threads;
+    for (int64_t row = 0; row < nrows; ++row) {
+        top_k_pair_keys<<<blocks_keys, threads, 0, stream>>>(
+                scores + row*ncols, indices + row*ncols, keys_in.get(), ncols);
+        CUDA_CHECK(cub::DeviceRadixSort::SortKeysDescending(
+                temp.get(), temp_size, keys_in.get(), keys_out.get(), ncols_i, 0, 64, stream));
+        top_k_pair_indices<<<blocks_dst, threads, 0, stream>>>(keys_out.get(), dst + row*k, k);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+#else
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(scores);
+    GGML_UNUSED(indices);
+    GGML_UNUSED(ncols);
+    GGML_UNUSED(nrows);
+    GGML_UNUSED(k);
+    GGML_UNUSED(dst);
+    return false;
 #endif
 }

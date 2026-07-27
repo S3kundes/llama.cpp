@@ -27,6 +27,8 @@ typedef void (* fattn_kernel_t)(
         const int  * __restrict__ KV_max,
         float      * __restrict__ dst,
         float2     * __restrict__ dst_meta,
+        float2     * __restrict__ final_meta,
+        const bool partial,
         const float scale,
         const float max_bias,
         const float m0,
@@ -727,6 +729,8 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
         const int ne12, const int nblocks_stream_k,
         const int gqa_ratio,
         const int blocks_per_tile,
+        float2 * final_meta,
+        const bool partial,
         const uint3 fd_iter_j_z_ne12,
         const uint3 fd_iter_j_z,
         const uint3 fd_iter_j) {
@@ -797,7 +801,11 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
     }
 
     // Write back final result:
-    *dst = dst_val / rowsum;
+    *dst = partial ? dst_val : dst_val/rowsum;
+    if (partial && tid == 0) {
+        const int j_dst_unrolled = (sequence*ne01 + jt*ncols1 + j)*ne02 + zt_Q + c;
+        final_meta[j_dst_unrolled] = make_float2(max_val, rowsum);
+    }
 }
 
 // General fixup kernel for the case where the number of blocks per tile is not uniform across tiles
@@ -810,6 +818,8 @@ static __global__ void flash_attn_stream_k_fixup_general(
         const int ne01, const int ne02,
         const int gqa_ratio,
         const int total_work,
+        float2 * final_meta,
+        const bool partial,
         const uint3 fd_iter_k_j_z_ne12,
         const uint3 fd_iter_k_j_z,
         const uint3 fd_iter_k_j,
@@ -908,7 +918,11 @@ static __global__ void flash_attn_stream_k_fixup_general(
     }
 
     // Write back final result:
-    *dst = dst_val / rowsum;
+    *dst = partial ? dst_val : dst_val/rowsum;
+    if (partial && tid == 0) {
+        const int j_dst_unrolled = (sequence*ne01 + jt*ncols1 + j)*ne02 + zt_Q + c;
+        final_meta[j_dst_unrolled] = make_float2(max_val, rowsum);
+    }
 }
 
 template<int D> // D == head size
@@ -917,7 +931,9 @@ static __global__ void flash_attn_combine_results(
         const float  * VKQ_parts_ptr,
         const float2 * VKQ_meta_ptr,
         float * dst_ptr,
-        const int parallel_blocks) {
+        float2 * final_meta_ptr,
+        const int parallel_blocks,
+        const bool partial) {
     ggml_cuda_pdl_lc();
     const float  * GGML_CUDA_RESTRICT VKQ_parts = VKQ_parts_ptr;
     const float2 * GGML_CUDA_RESTRICT VKQ_meta  = VKQ_meta_ptr;
@@ -966,14 +982,24 @@ static __global__ void flash_attn_combine_results(
         VKQ_denominator += KQ_max_scale * meta[l].y;
     }
 
-    dst[tid] = VKQ_numerator / VKQ_denominator;
+    dst[tid] = partial ? VKQ_numerator : VKQ_numerator/VKQ_denominator;
+    if (partial && tid == 0) {
+        final_meta_ptr[j_dst_unrolled] = make_float2(kqmax, VKQ_denominator);
+    }
 }
+
+extern thread_local float2 * ggml_cuda_fattn_final_meta;
 
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
-    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE
+    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE,
+    float2 * final_meta = nullptr
 ) {
+    if (final_meta == nullptr) {
+        final_meta = ggml_cuda_fattn_final_meta;
+    }
+    const bool partial = final_meta != nullptr;
     constexpr int ncols = ncols1 * ncols2;
 
     const ggml_tensor * Q = dst->src[0];
@@ -1216,6 +1242,7 @@ void launch_fattn(
         sinks ? ((const char *) sinks->data) : nullptr,
         KV_max.ptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
+        final_meta, partial,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
         K->ne[0], K->ne[1], K->ne[2], K->ne[3], nb11, nb12, nb13,
@@ -1242,7 +1269,7 @@ void launch_fattn(
             ggml_cuda_kernel_launch(flash_attn_stream_k_fixup_uniform<DV, ncols1, ncols2>, launch_params,
                 (float *) KQV->data, dst_tmp_meta.ptr,
                  Q->ne[1], Q->ne[2], K->ne[2], nblocks_sk,
-                 gqa_ratio, bpt, fd0, fd1, fd2);
+                 gqa_ratio, bpt, final_meta, partial, fd0, fd1, fd2);
         } else if (ntiles_dst % blocks_num.x != 0) {
             // General fixup for the cases where nblocks_stream_k < ntiles_dst.
             const int total_work = ntiles_KV * ntiles_dst;
@@ -1259,7 +1286,7 @@ void launch_fattn(
             ggml_cuda_kernel_launch(flash_attn_stream_k_fixup_general<DV, ncols1, ncols2>, launch_params,
                 (float *) KQV->data, dst_tmp_meta.ptr,
                  Q->ne[1], Q->ne[2], gqa_ratio, total_work,
-                 fd_k_j_z_ne12, fd_k_j_z, fd_k_j, fd_k);
+                 final_meta, partial, fd_k_j_z_ne12, fd_k_j_z, fd_k_j, fd_k);
         }
     } else if (parallel_blocks > 1) {
         const dim3 block_dim_combine(DV, 1, 1);
@@ -1268,7 +1295,7 @@ void launch_fattn(
 
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream);
         ggml_cuda_kernel_launch(flash_attn_combine_results<DV>, launch_params,
-            dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
+            dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, final_meta, parallel_blocks, partial);
     }
     CUDA_CHECK(cudaGetLastError());
 }

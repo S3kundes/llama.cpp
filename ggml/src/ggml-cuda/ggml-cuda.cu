@@ -67,6 +67,7 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
+#include "ggml-cuda/meta-collectives.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -1252,6 +1253,25 @@ static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct gg
     }
     auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
     return comm_ctx->try_allreduce(comm_ctx, tensors);
+}
+
+static bool ggml_backend_cuda_comm_execute_graph_node(
+        void * comm_ctx_v, const ggml_backend_comm_graph_node * node) {
+#ifdef GGML_USE_NCCL
+    if (comm_ctx_v == nullptr) {
+        return false;
+    }
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    if (comm_ctx->comms.size() != comm_ctx->backends.size()) {
+        return false;
+    }
+    return ggml_cuda_meta_execute_graph_node(
+            comm_ctx->backends.data(), comm_ctx->comms.data(), comm_ctx->backends.size(), node);
+#else
+    GGML_UNUSED(comm_ctx_v);
+    GGML_UNUSED(node);
+    return false;
+#endif
 }
 
 // host buffer type
@@ -5324,6 +5344,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
+    }
+    if (strcmp(name, "ggml_backend_comm_execute_graph_node") == 0) {
+        return (void *)ggml_backend_cuda_comm_execute_graph_node;
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;

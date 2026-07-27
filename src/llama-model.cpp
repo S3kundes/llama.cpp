@@ -26,6 +26,7 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <functional>
@@ -335,6 +336,11 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
     return llama_model_create(arch, params);
 }
 
+static bool llama_dsv4_kv_distributed_requested() {
+    const char * value = std::getenv("LLAMA_DSV4_KV_DISTRIBUTED");
+    return value != nullptr && std::atoi(value) > 0;
+}
+
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
     const llama_hparams & hparams = ud->model->hparams;
@@ -349,6 +355,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_qk_norm         ("blk\\.\\d*\\.attn_(q|k)_norm\\.weight");
     static const std::regex pattern_kv_cache         ("cache_(k|v)_l\\d*");
     static const std::regex pattern_dsv4_state       ("dsv4_(csa|hca|lid)_state_(kv|score)_l\\d*");
+    static const std::regex pattern_dsv4_kq_mask     ("(attn_inp_kq_mask|dsv4_(csa|hca|lid)_kq_mask)");
     static const std::regex pattern_attn_sinks       ("blk\\.\\d*\\.attn_sinks.weight");
     static const std::regex pattern_attn_out_weight  ("blk\\.\\d*\\.attn_output.weight");
     static const std::regex pattern_attn_out_bias    ("blk\\.\\d*\\.attn_output.bias");
@@ -356,6 +363,25 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_attn_out_b_weight("blk\\.\\d*\\.attn_output_b\\.weight");
     static const std::regex pattern_attn_q_b_weight  ("blk\\.\\d*\\.attn_q_b\\.weight");
     static const std::regex pattern_attn_gate_weight ("blk\\.\\d*\\.attn_gate.weight");
+
+    if (ud->model->arch == LLM_ARCH_DEEPSEEK4 && llama_dsv4_kv_distributed_requested() &&
+            (std::regex_match(tensor_name, pattern_kv_cache) ||
+             std::regex_search(tensor_name, pattern_dsv4_kq_mask))) {
+        GGML_ASSERT(ud->n_devices > 1);
+        const bool is_mask = std::regex_search(tensor_name, pattern_dsv4_kq_mask);
+        const int axis = is_mask ? 0 : 1;
+        const uint32_t n_round = LLAMA_DSV4_KV_PAGE_SIZE*ud->n_devices;
+        GGML_ASSERT(tensor->ne[axis] % n_round == 0);
+
+        ggml_backend_meta_split_state split_state = {};
+        split_state.axis = (ggml_backend_meta_split_axis) axis;
+        for (size_t j = 0; j < ud->n_devices; ++j) {
+            split_state.ne[j] = LLAMA_DSV4_KV_PAGE_SIZE;
+        }
+        split_state.nr[0] = tensor->ne[axis]/n_round;
+        split_state.n_segments = 1;
+        return split_state;
+    }
 
     static const std::regex pattern_ssm_dt          ("blk\\.\\d*\\.ssm_dt.bias");
     static const std::regex pattern_ssm_a           ("blk\\.\\d*\\.ssm_a");
@@ -2276,6 +2302,32 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             throw std::runtime_error("DeepSeek-V4 tensor split requires Flash Attention");
                         }
 
+                        const bool distributed = llama_dsv4_kv_distributed_requested();
+                        const uint32_t n_devices = get_split_state_ud.n_devices;
+                        if (distributed && split_mode() != LLAMA_SPLIT_MODE_TENSOR) {
+                            throw std::runtime_error("distributed DeepSeek-V4 KV cache requires tensor split mode");
+                        }
+                        if (distributed && n_devices <= 1) {
+                            throw std::runtime_error("distributed DeepSeek-V4 KV cache requires multiple tensor devices");
+                        }
+                        if (distributed && !cparams.offload_kqv) {
+                            throw std::runtime_error("distributed DeepSeek-V4 KV cache requires KV offload");
+                        }
+                        if (distributed && !cparams.fused_lid) {
+                            throw std::runtime_error("distributed DeepSeek-V4 KV cache requires fused Lightning Indexer");
+                        }
+                        if (distributed && params.type_k != GGML_TYPE_F32 &&
+                                params.type_k != GGML_TYPE_F16 && params.type_k != GGML_TYPE_BF16) {
+                            throw std::runtime_error("distributed DeepSeek-V4 KV cache supports only F32, F16, and BF16 cache types");
+                        }
+
+                        const uint32_t n_pad = distributed ? LLAMA_DSV4_KV_PAGE_SIZE*n_devices : 1;
+                        const uint32_t kv_size = GGML_PAD(cparams.n_ctx_seq, n_pad);
+                        if (distributed) {
+                            LLAMA_LOG_INFO("%s: distributing DSV4 KV cache in %u-row rounds across %u devices\n",
+                                    __func__, n_pad, n_devices);
+                        }
+
                         res = new llama_kv_cache_dsv4(
                                 *this,
                                 params.type_k,
@@ -2284,10 +2336,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 cparams.offload_kqv,
                                 params.swa_full,
                                 cparams.kv_unified,
-                                cparams.n_ctx_seq,
+                                kv_size,
                                 cparams.n_seq_max,
                                 cparams.n_ubatch,
-                                1,
+                                n_pad,
+                                distributed,
+                                n_devices,
                                 filter,
                                 reuse);
                     } else if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {

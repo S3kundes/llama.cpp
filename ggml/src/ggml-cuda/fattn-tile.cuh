@@ -799,6 +799,8 @@ static __global__ void flash_attn_tile(
         const int  * KV_max_ptr,
         float      * dst_ptr,
         float2     * dst_meta_ptr,
+        float2     * final_meta_ptr,
+        const bool partial,
         const float scale,
         const float max_bias,
         const float m0,
@@ -819,13 +821,14 @@ static __global__ void flash_attn_tile(
     const char * GGML_CUDA_RESTRICT mask     = mask_ptr;
     const char * GGML_CUDA_RESTRICT sinks    = sinks_ptr;
     const int  * GGML_CUDA_RESTRICT KV_max   = KV_max_ptr;
-    float      * GGML_CUDA_RESTRICT dst      = dst_ptr;
-    float2     * GGML_CUDA_RESTRICT dst_meta = dst_meta_ptr;
+    float      * GGML_CUDA_RESTRICT dst        = dst_ptr;
+    float2     * GGML_CUDA_RESTRICT dst_meta   = dst_meta_ptr;
+    float2     * GGML_CUDA_RESTRICT final_meta = final_meta_ptr;
 
     // Skip unused kernel variants for faster compilation:
 
     if ((use_logit_softcap && !(DV == 128 || DV == 256 || DV == 512))) {
-        GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
+        GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, final_meta, partial, scale,
             max_bias, m0, m1, n_head_log2, logit_softcap,
             ne00, ne01, ne02, ne03,
                   nb01, nb02, nb03,
@@ -1091,7 +1094,7 @@ static __global__ void flash_attn_tile(
             return;
         }
 
-        const float scale = gridDim.y == 1 ? 1.0f/KQ_sum[jc0] : 1.0f;
+        const float scale = gridDim.y == 1 && !partial ? 1.0f/KQ_sum[jc0] : 1.0f;
 
         const int j_dst_unrolled = ((sequence*int(ne01.z) + col_Q_0 + j)*ne02 + head0 + c)*gridDim.y + blockIdx.y;
 
@@ -1127,12 +1130,13 @@ static __global__ void flash_attn_tile(
         }
 #endif // FAST_FP16_AVAILABLE
 
-        if (gridDim.y != 1 && threadIdx.x == 0) {
-            dst_meta[j_dst_unrolled] = make_float2(KQ_max[jc0], KQ_sum[jc0]);
+        if ((gridDim.y != 1 || partial) && threadIdx.x == 0) {
+            float2 * meta = gridDim.y == 1 ? final_meta : dst_meta;
+            meta[j_dst_unrolled] = make_float2(KQ_max[jc0], KQ_sum[jc0]);
         }
     }
 #else
-    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
+    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, final_meta_ptr, partial, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
         ne00, ne01, ne02, ne03,
               nb01, nb02, nb03,

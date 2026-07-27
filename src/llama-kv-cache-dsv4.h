@@ -8,6 +8,8 @@
 #include <unordered_map>
 #include <vector>
 
+static constexpr uint32_t LLAMA_DSV4_KV_PAGE_SIZE = 256;
+
 class llama_dsv4_comp_state {
 public:
     using stream_copy_info = llama_kv_cache::stream_copy_info;
@@ -93,6 +95,8 @@ public:
                      uint32_t   n_seq_max,
                      uint32_t   n_ubatch,
                      uint32_t   n_pad,
+                         bool   distributed,
+                     uint32_t   n_devices,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse);
 
@@ -141,6 +145,9 @@ public:
     llama_dsv4_comp_state * get_hca_state() const;
     llama_dsv4_comp_state * get_lid_state() const;
 
+    bool is_distributed() const;
+    uint32_t get_n_pad() const;
+
 private:
     llama_hparams hparams_raw;
     llama_hparams hparams_csa;
@@ -148,6 +155,8 @@ private:
     llama_hparams hparams_lid;
 
     const uint32_t n_seq_max;
+    const bool distributed;
+    const uint32_t n_pad;
 
     std::unique_ptr<llama_kv_cache_iswa> kv_raw;
     std::unique_ptr<llama_kv_cache>      kv_csa;

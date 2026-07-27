@@ -421,7 +421,8 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
         bool overlap,
         uint32_t state_size,
         uint32_t kv_size,
-        uint32_t n_stream) {
+        uint32_t n_stream,
+        uint32_t n_pad) {
     llama_kv_cache_dsv4_context::comp_plan plan;
     plan.n_visible.resize(ubatch.n_tokens);
     plan.n_stream = dsv4_comp_graph_n_stream(ubatch, n_stream);
@@ -571,7 +572,7 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
                 overlap_cur_reads.begin(), overlap_cur_reads.end());
     }
 
-    plan.n_kv = GGML_PAD(plan.n_kv, 256u);
+    plan.n_kv = GGML_PAD(plan.n_kv, n_pad);
 
     std::sort(persist_rows.begin(), persist_rows.end(),
             [](const persist_row & a, const persist_row & b) {
@@ -604,12 +605,13 @@ static std::vector<llama_kv_cache_dsv4_context::comp_plan> dsv4_build_comp_plans
         bool overlap,
         uint32_t state_size,
         uint32_t kv_size,
-        uint32_t n_stream) {
+        uint32_t n_stream,
+        uint32_t n_pad) {
     std::vector<llama_kv_cache_dsv4_context::comp_plan> plans;
     plans.reserve(ubatches.size());
 
     for (const llama_ubatch & ubatch : ubatches) {
-        plans.push_back(dsv4_build_comp_plan(ubatch, ratio, overlap, state_size, kv_size, n_stream));
+        plans.push_back(dsv4_build_comp_plan(ubatch, ratio, overlap, state_size, kv_size, n_stream, n_pad));
     }
 
     return plans;
@@ -1022,13 +1024,19 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
                  uint32_t   n_seq_max,
                  uint32_t   n_ubatch,
                  uint32_t   n_pad,
+                     bool   distributed,
+                 uint32_t   n_devices,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse) :
     hparams_raw(model.hparams),
     hparams_csa(model.hparams),
     hparams_hca(model.hparams),
     hparams_lid(model.hparams),
-    n_seq_max(n_seq_max) {
+    n_seq_max(n_seq_max),
+    distributed(distributed),
+    n_pad(n_pad) {
+
+    GGML_ASSERT(!distributed || (n_devices > 1 && n_pad == LLAMA_DSV4_KV_PAGE_SIZE*n_devices));
 
     const layer_filter_cb filter_raw = [&](int32_t il) {
         if (filter && !filter(il)) {
@@ -1086,7 +1094,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
 
     kv_csa = std::make_unique<llama_kv_cache>(
             model, hparams_csa, type_k, type_v,
-            v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u), n_seq_max, n_pad,
+            v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), n_pad), n_seq_max, n_pad,
             0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr);
 
     LLAMA_LOG_INFO("%s: creating DSV4 HCA compressed KV cache, size = %u cells\n",
@@ -1094,7 +1102,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
 
     kv_hca = std::make_unique<llama_kv_cache>(
             model, hparams_hca, type_k, type_v,
-            v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_HCA_RATIO), 256u), n_seq_max, n_pad,
+            v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_HCA_RATIO), n_pad), n_seq_max, n_pad,
             0, LLAMA_SWA_TYPE_NONE, nullptr, filter_hca, nullptr, nullptr);
 
     LLAMA_LOG_INFO("%s: creating DSV4 lightning-indexer KV cache, size = %u cells\n",
@@ -1102,7 +1110,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
 
     kv_lid = std::make_unique<llama_kv_cache>(
             model, hparams_lid, type_k, type_v,
-            v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u), n_seq_max, n_pad,
+            v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), n_pad), n_seq_max, n_pad,
             0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr);
 
     LLAMA_LOG_INFO("%s: creating DSV4 CSA compressor state\n", __func__);
@@ -1462,6 +1470,14 @@ llama_dsv4_comp_state * llama_kv_cache_dsv4::get_lid_state() const {
     return lid_state.get();
 }
 
+bool llama_kv_cache_dsv4::is_distributed() const {
+    return distributed;
+}
+
+uint32_t llama_kv_cache_dsv4::get_n_pad() const {
+    return n_pad;
+}
+
 void llama_kv_cache_dsv4::clear_compressed(llama_seq_id seq_id, bool data) {
     if (seq_id < 0) {
         kv_csa->clear(data);
@@ -1779,9 +1795,9 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
         std::vector<llama_ubatch> ubatches_raw) :
     ubatches(std::move(ubatches)),
     plans_csa(dsv4_build_comp_plans(this->ubatches, DSV4_CSA_RATIO, true,
-                kv->get_csa_state()->get_state_size(), kv->get_csa()->get_size(), kv->get_csa_state()->get_n_stream())),
+                kv->get_csa_state()->get_state_size(), kv->get_csa()->get_size(), kv->get_csa_state()->get_n_stream(), kv->get_n_pad())),
     plans_hca(dsv4_build_comp_plans(this->ubatches, DSV4_HCA_RATIO, false,
-                kv->get_hca_state()->get_state_size(), kv->get_hca()->get_size(), kv->get_hca_state()->get_n_stream())),
+                kv->get_hca_state()->get_state_size(), kv->get_hca()->get_size(), kv->get_hca_state()->get_n_stream(), kv->get_n_pad())),
     plans_lid(plans_csa),
     ctx_raw(std::make_unique<llama_kv_cache_dsv4_raw_context>(
                 kv->get_raw(),

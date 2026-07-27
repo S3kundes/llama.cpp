@@ -396,3 +396,130 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         GGML_ABORT("unsupported type %s", ggml_type_name(src0->type));
     }
 }
+
+template <typename src_t, typename idx_t, typename dst_t>
+static __global__ void k_set_rows_sharded(
+        const src_t * src0,
+        const idx_t * src1,
+        dst_t * dst,
+        int64_t ne_total,
+        int64_t s01,
+        int64_t s02,
+        int64_t s03,
+        int64_t s10,
+        int64_t s11,
+        int64_t s12,
+        int64_t s1,
+        int64_t s2,
+        int64_t s3,
+        uint3 ne00,
+        uint3 ne01,
+        uint3 ne02,
+        uint3 ne11,
+        uint3 ne12,
+        int rank,
+        int n_ranks,
+        int64_t page_size) {
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+    if (i >= ne_total) {
+        return;
+    }
+
+    uint32_t tmp = (uint32_t) i;
+    uint2 div_mod = fast_div_modulo(tmp, ne00);
+    const int64_t i00 = div_mod.y;
+    tmp = div_mod.x;
+    div_mod = fast_div_modulo(tmp, ne01);
+    const int64_t i01 = div_mod.y;
+    tmp = div_mod.x;
+    div_mod = fast_div_modulo(tmp, ne02);
+    const int64_t i02 = div_mod.y;
+    const int64_t i03 = div_mod.x;
+
+    const int64_t i12 = fastmodulo((uint32_t) i03, ne12);
+    const int64_t i11 = fastmodulo((uint32_t) i02, ne11);
+    const int64_t global_row = src1[i01*s10 + i11*s11 + i12*s12];
+    const int64_t page = global_row/page_size;
+    if (page % n_ranks != rank) {
+        return;
+    }
+
+    const int64_t local_row = (page/n_ranks)*page_size + global_row%page_size;
+    const src_t * src0_row = src0 + i01*s01 + i02*s02 + i03*s03;
+    dst[local_row*s1 + i02*s2 + i03*s3 + i00] = ggml_cuda_cast<dst_t>(src0_row[i00]);
+}
+
+template <typename src_t, typename idx_t, typename dst_t>
+static void set_rows_sharded_cuda(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        ggml_tensor * dst,
+        int rank,
+        int n_ranks,
+        int64_t page_size) {
+    const int64_t ne_total = ggml_nelements(src0);
+    if (ne_total == 0) {
+        return;
+    }
+
+    const dim3 block_size(CUDA_SET_ROWS_BLOCK_SIZE);
+    const dim3 grid_size((ne_total + CUDA_SET_ROWS_BLOCK_SIZE - 1)/CUDA_SET_ROWS_BLOCK_SIZE);
+    const uint3 ne00 = init_fastdiv_values((uint32_t) src0->ne[0]);
+    const uint3 ne01 = init_fastdiv_values((uint32_t) src0->ne[1]);
+    const uint3 ne02 = init_fastdiv_values((uint32_t) src0->ne[2]);
+    const uint3 ne11 = init_fastdiv_values((uint32_t) src1->ne[1]);
+    const uint3 ne12 = init_fastdiv_values((uint32_t) src1->ne[2]);
+
+    ggml_cuda_kernel_launch_params launch_params(grid_size, block_size, 0, ctx.stream());
+    ggml_cuda_kernel_launch(k_set_rows_sharded<src_t, idx_t, dst_t>, launch_params,
+            (const src_t *) src0->data, (const idx_t *) src1->data, (dst_t *) dst->data,
+            ne_total,
+            src0->nb[1]/sizeof(src_t), src0->nb[2]/sizeof(src_t), src0->nb[3]/sizeof(src_t),
+            src1->nb[0]/sizeof(idx_t), src1->nb[1]/sizeof(idx_t), src1->nb[2]/sizeof(idx_t),
+            dst->nb[1]/sizeof(dst_t), dst->nb[2]/sizeof(dst_t), dst->nb[3]/sizeof(dst_t),
+            ne00, ne01, ne02, ne11, ne12,
+            rank, n_ranks, page_size);
+}
+
+template <typename src_t, typename idx_t>
+static void set_rows_sharded_cuda(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        ggml_tensor * dst,
+        int rank,
+        int n_ranks,
+        int64_t page_size) {
+    switch (dst->type) {
+        case GGML_TYPE_F32:
+            set_rows_sharded_cuda<src_t, idx_t, float>(ctx, src0, src1, dst, rank, n_ranks, page_size);
+            break;
+        case GGML_TYPE_F16:
+            set_rows_sharded_cuda<src_t, idx_t, half>(ctx, src0, src1, dst, rank, n_ranks, page_size);
+            break;
+        case GGML_TYPE_BF16:
+            set_rows_sharded_cuda<src_t, idx_t, nv_bfloat16>(ctx, src0, src1, dst, rank, n_ranks, page_size);
+            break;
+        default:
+            GGML_ABORT("unsupported sharded SET_ROWS destination type %s", ggml_type_name(dst->type));
+    }
+}
+
+void ggml_cuda_op_set_rows_sharded(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst, int rank, int n_ranks, int64_t page_size) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
+    GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);
+
+    if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_I64) {
+        set_rows_sharded_cuda<float, int64_t>(ctx, src0, src1, dst, rank, n_ranks, page_size);
+    } else if (src0->type == GGML_TYPE_F32) {
+        set_rows_sharded_cuda<float, int32_t>(ctx, src0, src1, dst, rank, n_ranks, page_size);
+    } else if (src1->type == GGML_TYPE_I64) {
+        set_rows_sharded_cuda<half, int64_t>(ctx, src0, src1, dst, rank, n_ranks, page_size);
+    } else {
+        set_rows_sharded_cuda<half, int32_t>(ctx, src0, src1, dst, rank, n_ranks, page_size);
+    }
+}

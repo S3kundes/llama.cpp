@@ -393,6 +393,14 @@ extern "C" {
         uint32_t n_segments;
     };
 
+    struct ggml_backend_comm_graph_node {
+        struct ggml_tensor ** nodes;
+        struct ggml_backend_meta_split_state split;
+        struct ggml_backend_meta_split_state src[GGML_MAX_SRC];
+    };
+
+    typedef bool (*ggml_backend_comm_execute_graph_node_t)(void * comm_ctx, const struct ggml_backend_comm_graph_node * node);
+
     // function to assign split states for statically allocated tensors, compute tensor split states will be assigned to be compatible:
     typedef struct ggml_backend_meta_split_state(*ggml_backend_meta_get_split_state_t)(const struct ggml_tensor * tensor, void * userdata);
 

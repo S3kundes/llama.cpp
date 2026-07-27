@@ -5,6 +5,8 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
+thread_local float2 * ggml_cuda_fattn_final_meta = nullptr;
+
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -582,6 +584,13 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
             break;
     }
+}
+
+void ggml_cuda_flash_attn_ext_partial(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float2 * meta) {
+    GGML_ASSERT(meta != nullptr && ggml_cuda_fattn_final_meta == nullptr);
+    ggml_cuda_fattn_final_meta = meta;
+    ggml_cuda_flash_attn_ext(ctx, dst);
+    ggml_cuda_fattn_final_meta = nullptr;
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {

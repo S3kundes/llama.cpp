@@ -47,7 +47,7 @@ RUN if [ "${CUDA_DOCKER_ARCH}" != "default" ]; then \
     fi && \
     cmake -B build -DGGML_NATIVE=OFF -DGGML_CUDA=ON -DGGML_CUDA_NCCL=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DLLAMA_BUILD_TESTS=OFF ${CMAKE_ARGS} -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined . && \
     cmake --build build --config Release -j$(nproc) && \
-    ldd build/bin/libggml-cuda.so | grep -q libnccl
+    ldd build/bin/libggml-cuda.so | grep libnccl | grep -qv "not found"
 
 RUN mkdir -p /app/lib && \
     find build -name "*.so*" -exec cp -P {} /app/lib \;
@@ -86,6 +86,8 @@ RUN apt-get update \
     && find /var/cache -type f -delete
 
 COPY --from=build /app/lib/ /app
+
+RUN ldd /app/libggml-cuda.so | grep libnccl | grep -qv "not found"
 
 ### Full
 FROM base AS full
